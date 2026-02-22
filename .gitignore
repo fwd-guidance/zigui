@@ -1,0 +1,5 @@
+.DS_store
+zig-out/
+.zig-cache/
+*.ttf
+*.otf
