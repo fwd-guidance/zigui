@@ -35,7 +35,8 @@ pub const BoxFlags = packed struct {
     layout_horizontal: bool = false,
     clip_children: bool = false,
     floating: bool = false,
-    _padding: u11 = 0,
+    scrollable_y: bool = false,
+    _padding: u10 = 0,
 };
 
 pub const TextAlign = enum { left, center, right };
@@ -101,6 +102,8 @@ pub const InputState = struct {
     mouse_left_down: bool = false,
     mouse_left_pressed: bool = false,
     mouse_left_released: bool = false,
+
+    scroll_y: f32 = 0.0,
 };
 
 pub const Font = struct {
@@ -143,6 +146,7 @@ pub const UI = struct {
     active_hash: u64 = 0,
 
     layout_cache: std.AutoHashMap(u64, [4]f32),
+    scroll_state: std.AutoHashMap(u64, [2]f32),
 
     pub fn init(allocator: std.mem.Allocator) !UI {
         return UI{
@@ -150,6 +154,7 @@ pub const UI = struct {
             .frame_arena = std.heap.ArenaAllocator.init(allocator),
             .retained_state = std.AutoHashMap(u64, BoxState).init(allocator),
             .layout_cache = std.AutoHashMap(u64, [4]f32).init(allocator),
+            .scroll_state = std.AutoHashMap(u64, [2]f32).init(allocator),
         };
     }
 
@@ -157,6 +162,7 @@ pub const UI = struct {
         self.retained_state.deinit();
         self.frame_arena.deinit();
         self.layout_cache.deinit();
+        self.scroll_state.deinit();
     }
 
     fn generateId(self: *UI, string_id: []const u8) u64 {
@@ -358,9 +364,57 @@ pub const UI = struct {
         // 1. Lock in the final size
         node.rect.size = node.calculated_size;
 
-        // Start the layout cursor at the top-left, inset by padding
+        self.layout_cache.put(node.hash, .{ node.rect.pos[0], node.rect.pos[1], node.rect.size[0], node.rect.size[1] }) catch {};
+
+        // --- 2. HANDLE SCROLL STATE ---
+        var scroll_offset: f32 = 0.0;
+        var prev_content_height: f32 = 0.0; // Track the height from last frame
+
+        if (node.flags.scrollable_y) {
+            // Read both the offset and the previous height from the cache
+            if (self.scroll_state.get(node.hash)) |state| {
+                scroll_offset = state[0];
+                prev_content_height = state[1];
+            }
+
+            // Read input
+            if (self.layout_cache.get(node.hash)) |rect| {
+                const mx = self.input.mouse_x;
+                const my = self.input.mouse_y;
+                if (mx >= rect[0] and mx <= rect[0] + rect[2] and my >= rect[1] and my <= rect[1] + rect[3]) {
+                    scroll_offset -= self.input.scroll_y * 20.0;
+                }
+            }
+
+            // CLAMP IMMEDIATELY! (Using last frame's content height)
+            const max_scroll = @max(0.0, prev_content_height - (node.rect.size[1] - (node.padding * 2.0)));
+            scroll_offset = @max(0.0, @min(max_scroll, scroll_offset));
+        }
+
+        // --- 3. APPLY THE OFFSET ---
         var cursor_x = node.rect.pos[0] + node.padding;
-        var cursor_y = node.rect.pos[1] + node.padding;
+        var cursor_y = node.rect.pos[1] + node.padding - scroll_offset;
+
+        // Start the layout cursor at the top-left, inset by padding
+        //var cursor_x = node.rect.pos[0] + node.padding;
+
+        //// --- 1. HANDLE SCROLL STATE ---
+        //var scroll_offset: f32 = 0.0;
+        //if (node.flags.scrollable_y) {
+        //    scroll_offset = self.scroll_state.get(node.hash) orelse 0.0;
+
+        //    // Read input if the mouse is hovering inside this specific container
+        //    if (self.layout_cache.get(node.hash)) |rect| {
+        //        const mx = self.input.mouse_x;
+        //        const my = self.input.mouse_y;
+        //        if (mx >= rect[0] and mx <= rect[0] + rect[2] and my >= rect[1] and my <= rect[1] + rect[3]) {
+        //            // Multiply by 20.0 for scroll speed. Adjust to your liking!
+        //            scroll_offset -= self.input.scroll_y * 20.0;
+        //        }
+        //    }
+        //}
+
+        //var cursor_y = node.rect.pos[1] + node.padding - scroll_offset;
 
         var child_it = node.first;
         while (child_it) |child| : (child_it = child.next) {
@@ -386,7 +440,7 @@ pub const UI = struct {
             // 3. Position the child
             child.rect.pos = .{ cursor_x, cursor_y };
 
-            self.layout_cache.put(child.hash, .{ child.rect.pos[0], child.rect.pos[1], child.calculated_size[0], child.calculated_size[1] }) catch {};
+            //self.layout_cache.put(child.hash, .{ child.rect.pos[0], child.rect.pos[1], child.calculated_size[0], child.calculated_size[1] }) catch {};
 
             // 4. Inherit clip rects (prevents children from drawing outside their parents)
             child.clip_rect = .{
@@ -405,6 +459,27 @@ pub const UI = struct {
 
             // 6. Recurse down the tree
             self.computeLayout(child);
+        }
+
+        // --- 3. CLAMP AND SAVE SCROLL ---
+        //if (node.flags.scrollable_y) {
+        //    // How far down did the cursor go?
+        //    const content_height = (cursor_y + scroll_offset) - (node.rect.pos[1] + node.padding);
+
+        //    // The maximum amount we are allowed to scroll
+        //    const max_scroll = @max(0.0, content_height - (node.rect.size[1] - (node.padding * 2.0)));
+
+        //    // Clamp and save
+        //    scroll_offset = @max(0.0, @min(max_scroll, scroll_offset));
+        //    self.scroll_state.put(node.hash, scroll_offset) catch {};
+        //}
+
+        if (node.flags.scrollable_y) {
+            // Calculate actual content height based on where the cursor ended up
+            const content_height = (cursor_y + scroll_offset) - (node.rect.pos[1] + node.padding);
+
+            // Save both the offset and the new height to the map
+            self.scroll_state.put(node.hash, .{ scroll_offset, content_height }) catch {};
         }
     }
 
@@ -748,6 +823,11 @@ const wgsl_shader =
     \\     return out;
     \\ }
     \\ @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    \\     // If the pixel is outside the inherited clip bounds, throw it away!
+    \\     if (in.clip_pos.x < in.clip_rect.x || in.clip_pos.y < in.clip_rect.y || in.clip_pos.x > in.clip_rect.z || in.clip_pos.y > in.clip_rect.w) {
+    \\         discard;
+    \\     }
+    \\
     \\     // WGPU automatically converts @builtin(position) to framebuffer pixel coordinates here
     \\     let pixel_x = in.clip_pos.x;
     \\     let pixel_y = in.clip_pos.y;
@@ -1231,7 +1311,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     ui.beginFrame(dt, input);
 
     // --- MAIN CONTAINER ---
-    var main_panel = ui.pushBox("Container", BoxFlags{ .draw_background = true, .layout_horizontal = false });
+    var main_panel = ui.pushBox("Container", BoxFlags{ .draw_background = true, .layout_horizontal = false, .scrollable_y = true });
     main_panel.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
     main_panel.bg_color = .{ 0.1, 0.1, 0.1, 1.0 };
 
@@ -1332,6 +1412,7 @@ pub fn main() !void {
         // 1. Reset 1-frame input triggers at the start of every frame
         current_input.mouse_left_pressed = false;
         current_input.mouse_left_released = false;
+        current_input.scroll_y = 0.0;
 
         // 2. Poll RGFW Events
         var event: c.RGFW_event = undefined;
@@ -1363,6 +1444,9 @@ pub fn main() !void {
                         //c.RGFW_window_setShouldClose(app.window, 1);
                         running = false;
                     }
+                },
+                c.RGFW_mouseScroll => {
+                    current_input.scroll_y = event.scroll.y;
                 },
                 else => {},
             }
