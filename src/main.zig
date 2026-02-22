@@ -11,6 +11,8 @@ const c = @cImport({
 // 1. UI DATA STRUCTURES & ARCHITECTURE
 // ==========================================
 
+var counter: i32 = 0;
+
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
     size: [2]f32 = .{ 0.0, 0.0 },
@@ -95,6 +97,14 @@ pub const Font = struct {
     cdata: [96]c.stbtt_bakedchar, // ASCII characters 32 through 126
     texture: c.WGPUTexture,
     bind_group: c.WGPUBindGroup,
+};
+
+const AppContext = struct {
+    app: *AppState,
+    ui: *UI,
+    input: *InputState,
+    window_width: *u32,
+    window_height: *u32,
 };
 
 // ==========================================
@@ -950,6 +960,58 @@ const AppState = struct {
 // 4. MAIN LOOP
 // ==========================================
 
+fn onWindowResize(window: ?*c.RGFW_window, width: c_int, height: c_int) callconv(.c) void {
+    // 1. Prevent WebGPU crash on window minimize
+    if (width <= 0 or height <= 0) return;
+
+    // 2. Extract our AppContext from the raw C pointer
+    const ptr = c.RGFW_window_getUserPtr(window);
+    if (ptr == null) return;
+    const ctx: *AppContext = @ptrCast(@alignCast(ptr));
+
+    // 3. Update the global dimensions
+    ctx.window_width.* = @intCast(width);
+    ctx.window_height.* = @intCast(height);
+
+    // 4. Immediately rebuild the surface and force a render!
+    ctx.app.configureSurface(ctx.window_width.*, ctx.window_height.*);
+
+    // We pass a hardcoded 1/60th delta-time because the main loop's timer is paused
+    renderAppFrame(ctx.app, ctx.ui, ctx.input.*, 0.016, ctx.window_width.*, ctx.window_height.*);
+}
+
+fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_width: u32, window_height: u32) void {
+    ui.beginFrame(dt, input);
+
+    // --- MAIN CONTAINER ---
+    var main_panel = ui.pushBox("Container", BoxFlags{ .draw_background = true, .layout_horizontal = false });
+    main_panel.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
+    main_panel.bg_color = .{ 0.1, 0.1, 0.1, 1.0 };
+
+    var counter_buf: [32]u8 = undefined;
+    const counter_text = std.fmt.bufPrint(&counter_buf, "Counter: {d}", .{counter}) catch "Counter: Error";
+
+    ui.label(counter_text);
+    // --- BUTTON 1 ---
+    if (ui.button("Increment")) {
+        counter += 1;
+    }
+
+    // --- INVISIBLE SPACER ---
+    var spacer = ui.pushBox("Spacer", BoxFlags{});
+    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    ui.popBox();
+
+    // --- BUTTON 2 ---
+    if (ui.button("Decrement")) {
+        counter -= 1;
+    }
+
+    ui.popBox();
+
+    ui.endFrame(app, @floatFromInt(window_width), @floatFromInt(window_height));
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -964,11 +1026,22 @@ pub fn main() !void {
     var ui = try UI.init(gpa.allocator());
     defer ui.deinit();
 
-    const dt: f32 = 0.016; // Simulate 60fps for example
+    const dt: f32 = 0.008; // Simulate 60fps for example
 
     // Create a persistent input state outside the loop
     var current_input = InputState{};
     var running = true;
+
+    var ctx = AppContext{
+        .app = &app,
+        .ui = &ui,
+        .input = &current_input,
+        .window_width = &window_width,
+        .window_height = &window_height,
+    };
+
+    c.RGFW_window_setUserPtr(app.window, &ctx);
+    _ = c.RGFW_setWindowResizedCallback(onWindowResize);
 
     while (running and c.RGFW_window_shouldClose(app.window) == 0) {
         // 1. Reset 1-frame input triggers at the start of every frame
@@ -979,18 +1052,6 @@ pub fn main() !void {
         var event: c.RGFW_event = undefined;
         while (c.RGFW_window_checkEvent(app.window, &event) != 0) {
             switch (event.type) {
-                c.RGFW_windowResized => {
-                    var w: c_int = 0;
-                    var h: c_int = 0;
-
-                    _ = c.RGFW_window_getSize(app.window, &w, &h);
-                    // RGFW updates the window struct dimensions automatically
-                    window_width = @intCast(w);
-                    window_height = @intCast(h);
-
-                    // Rebuild the swapchain immediately!
-                    app.configureSurface(window_width, window_height);
-                },
                 c.RGFW_mousePosChanged => {
                     // Update mouse position (cast from integer to f32)
                     current_input.mouse_x = @floatFromInt(event.mouse.x);
@@ -1024,34 +1085,7 @@ pub fn main() !void {
 
         if (!running) break;
 
-        // 3. Build UI Tree
-        ui.beginFrame(dt, current_input);
-
-        // --- MAIN CONTAINER ---
-        var main_panel = ui.pushBox("Container", BoxFlags{ .draw_background = true, .layout_horizontal = false });
-        main_panel.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
-        main_panel.bg_color = .{ 0.1, 0.1, 0.1, 1.0 };
-
-        ui.label("My Zig GUI Engine");
-        // --- BUTTON 1 ---
-        if (ui.button("Start")) {
-            std.debug.print("Start Button Clicked!\n", .{});
-        }
-
-        // --- INVISIBLE SPACER ---
-        var spacer = ui.pushBox("Spacer", BoxFlags{});
-        spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
-        ui.popBox();
-
-        // --- BUTTON 2 ---
-        if (ui.button("Settings")) {
-            std.debug.print("Settings Button Clicked!\n", .{});
-        }
-
-        ui.popBox();
-
-        // 4. Layout & Render Frame
-        ui.endFrame(&app, @floatFromInt(window_width), @floatFromInt(window_height));
+        renderAppFrame(&app, &ui, current_input, dt, window_width, window_height);
     }
 }
 
