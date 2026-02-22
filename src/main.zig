@@ -25,11 +25,6 @@ pub const SizeConstraint = struct {
     value: f32 = 0.0,
 };
 
-//pub const Size = struct {
-//    kind: SizeKind,
-//    value: f32,
-//};
-
 pub const BoxFlags = packed struct {
     clickable: bool = false,
     draw_background: bool = false,
@@ -392,70 +387,6 @@ pub const UI = struct {
             self.computeLayout(child);
         }
     }
-
-    //fn computeSizeBottomUp(self: *UI, node: *Box) void {
-    //    var child_opt = node.first;
-    //    while (child_opt) |child| : (child_opt = child.next) {
-    //        self.computeSizeBottomUp(child);
-    //    }
-
-    //    for (0..2) |axis| {
-    //        switch (node.pref_size[axis].kind) {
-    //            .pixels => node.rect.size[axis] = node.pref_size[axis].value,
-    //            .children_sum => {
-    //                var total: f32 = 0.0;
-    //                var max: f32 = 0.0;
-    //                var iter = node.first;
-    //                while (iter) |b| : (iter = b.next) {
-    //                    if (!b.flags.floating) {
-    //                        total += b.rect.size[axis];
-    //                        max = @max(max, b.rect.size[axis]);
-    //                    }
-    //                }
-    //                const is_layout_axis = (axis == 0 and node.flags.layout_horizontal) or
-    //                    (axis == 1 and !node.flags.layout_horizontal);
-    //                node.rect.size[axis] = if (is_layout_axis) total else max;
-    //            },
-    //            .percent_of_parent => {}, // Handled top-down
-    //        }
-    //    }
-    //}
-
-    //fn computeLayoutTopDown(self: *UI, node: *Box, start_x: f32, start_y: f32) void {
-    //    node.rect.pos = .{ start_x, start_y };
-    //    var cursor_x = start_x;
-    //    var cursor_y = start_y;
-
-    //    var children_clip = node.clip_rect;
-    //    if (node.flags.clip_children) {
-    //        children_clip[0] = @max(children_clip[0], node.rect.pos[0]);
-    //        children_clip[1] = @max(children_clip[1], node.rect.pos[1]);
-    //        children_clip[2] = @min(children_clip[2], node.rect.pos[0] + node.rect.size[0]);
-    //        children_clip[3] = @min(children_clip[3], node.rect.pos[1] + node.rect.size[1]);
-    //    }
-
-    //    var child_opt = node.first;
-    //    while (child_opt) |child| : (child_opt = child.next) {
-    //        for (0..2) |axis| {
-    //            if (child.pref_size[axis].kind == .percent_of_parent) {
-    //                child.rect.size[axis] = node.rect.size[axis] * (child.pref_size[axis].value / 100.0);
-    //            }
-    //        }
-
-    //        if (child.flags.floating) {
-    //            child.clip_rect = .{ 0.0, 0.0, 800.0, 600.0 }; // Escape clipping
-    //            self.computeLayoutTopDown(child, start_x, start_y);
-    //        } else {
-    //            child.clip_rect = children_clip;
-    //            self.computeLayoutTopDown(child, cursor_x, cursor_y);
-    //            if (node.flags.layout_horizontal) {
-    //                cursor_x += child.rect.size[0];
-    //            } else {
-    //                cursor_y += child.rect.size[1];
-    //            }
-    //        }
-    //    }
-    //}
 
     fn buildRenderCommands(self: *UI, node: *Box, instances: *std.ArrayList(InstanceData), font: *Font) void {
         // Cache state for next frame
@@ -1143,7 +1074,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     ui.popBox();
 
     // --- BUTTON 2 ---
-    if (ui.buttonFullWidth("Decrement", .{})) {
+    if (ui.button("Decrement", .{})) {
         counter -= 1;
     }
 
