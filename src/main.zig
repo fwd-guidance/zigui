@@ -395,27 +395,6 @@ pub const UI = struct {
         var cursor_x = node.rect.pos[0] + node.padding;
         var cursor_y = node.rect.pos[1] + node.padding - scroll_offset;
 
-        // Start the layout cursor at the top-left, inset by padding
-        //var cursor_x = node.rect.pos[0] + node.padding;
-
-        //// --- 1. HANDLE SCROLL STATE ---
-        //var scroll_offset: f32 = 0.0;
-        //if (node.flags.scrollable_y) {
-        //    scroll_offset = self.scroll_state.get(node.hash) orelse 0.0;
-
-        //    // Read input if the mouse is hovering inside this specific container
-        //    if (self.layout_cache.get(node.hash)) |rect| {
-        //        const mx = self.input.mouse_x;
-        //        const my = self.input.mouse_y;
-        //        if (mx >= rect[0] and mx <= rect[0] + rect[2] and my >= rect[1] and my <= rect[1] + rect[3]) {
-        //            // Multiply by 20.0 for scroll speed. Adjust to your liking!
-        //            scroll_offset -= self.input.scroll_y * 20.0;
-        //        }
-        //    }
-        //}
-
-        //var cursor_y = node.rect.pos[1] + node.padding - scroll_offset;
-
         var child_it = node.first;
         while (child_it) |child| : (child_it = child.next) {
 
@@ -440,8 +419,6 @@ pub const UI = struct {
             // 3. Position the child
             child.rect.pos = .{ cursor_x, cursor_y };
 
-            //self.layout_cache.put(child.hash, .{ child.rect.pos[0], child.rect.pos[1], child.calculated_size[0], child.calculated_size[1] }) catch {};
-
             // 4. Inherit clip rects (prevents children from drawing outside their parents)
             child.clip_rect = .{
                 @max(node.clip_rect[0], child.rect.pos[0]),
@@ -462,18 +439,6 @@ pub const UI = struct {
         }
 
         // --- 3. CLAMP AND SAVE SCROLL ---
-        //if (node.flags.scrollable_y) {
-        //    // How far down did the cursor go?
-        //    const content_height = (cursor_y + scroll_offset) - (node.rect.pos[1] + node.padding);
-
-        //    // The maximum amount we are allowed to scroll
-        //    const max_scroll = @max(0.0, content_height - (node.rect.size[1] - (node.padding * 2.0)));
-
-        //    // Clamp and save
-        //    scroll_offset = @max(0.0, @min(max_scroll, scroll_offset));
-        //    self.scroll_state.put(node.hash, scroll_offset) catch {};
-        //}
-
         if (node.flags.scrollable_y) {
             // Calculate actual content height based on where the cursor ended up
             const content_height = (cursor_y + scroll_offset) - (node.rect.pos[1] + node.padding);
