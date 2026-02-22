@@ -12,6 +12,9 @@ const c = @cImport({
 // ==========================================
 
 var counter: i32 = 0;
+var vsync_enabled: bool = true;
+var show_debug: bool = false;
+var graphics_quality: usize = 1; // 0=Low, 1=Medium, 2=High
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -515,6 +518,96 @@ pub const UI = struct {
 
         self.popBox();
         return self.active_hash == box.hash and self.input.mouse_left_released and self.hot_hash_this_frame == box.hash;
+    }
+
+    pub fn checkbox(self: *UI, text: []const u8, state: *bool) bool {
+        var changed = false;
+
+        // 1. A clickable horizontal row that tightly wraps its children
+        var row = self.pushBox(text, BoxFlags{ .layout_horizontal = true, .clickable = true });
+        row.pref_size = .{ .{ .kind = .children_sum, .value = 0.0 }, .{ .kind = .children_sum, .value = 0.0 } };
+        row.gap = 10.0; // Space between the square and the text
+
+        // 2. The outer square box
+        var box = self.pushBox("box", BoxFlags{ .draw_background = true });
+        box.pref_size = .{ .{ .kind = .pixels, .value = 24.0 }, .{ .kind = .pixels, .value = 24.0 } };
+        box.corner_radius = 4.0;
+        box.padding = 6.0; // This perfectly insets our 100% width checkmark!
+
+        // Color interpolation based on the ROW's interaction state
+        if (self.active_hash == row.hash) {
+            box.bg_color = .{ 0.2, 0.4, 0.8, 1.0 };
+        } else if (self.hot_hash_this_frame == row.hash) {
+            box.bg_color = .{ 0.3, 0.5, 0.9, 1.0 };
+        } else {
+            box.bg_color = .{ 0.15, 0.25, 0.45, 1.0 };
+        }
+
+        // 3. The inner checkmark (only drawn if state is true)
+        if (state.*) {
+            var check = self.pushBox("check", BoxFlags{ .draw_background = true });
+            check.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
+            check.bg_color = .{ 1.0, 1.0, 1.0, 1.0 }; // White square
+            check.corner_radius = 2.0;
+            self.popBox(); // pop check
+        }
+        self.popBox(); // pop box
+
+        // 4. The text label
+        self.label(text);
+
+        // 5. Trigger the toggle
+        if (self.active_hash == row.hash and self.input.mouse_left_released and self.hot_hash_this_frame == row.hash) {
+            state.* = !state.*;
+            changed = true;
+        }
+
+        self.popBox(); // pop row
+        return changed;
+    }
+
+    // We use usize here, but you can easily change this to support Enums!
+    pub fn radioButton(self: *UI, text: []const u8, active_value: *usize, this_value: usize) bool {
+        var changed = false;
+
+        var row = self.pushBox(text, BoxFlags{ .layout_horizontal = true, .clickable = true });
+        row.pref_size = .{ .{ .kind = .children_sum, .value = 0.0 }, .{ .kind = .children_sum, .value = 0.0 } };
+        row.gap = 10.0;
+
+        var box = self.pushBox("radio", BoxFlags{ .draw_background = true });
+        box.pref_size = .{ .{ .kind = .pixels, .value = 24.0 }, .{ .kind = .pixels, .value = 24.0 } };
+        box.corner_radius = 12.0; // 12 is half of 24 = Perfect Circle!
+        box.padding = 6.0;
+
+        if (self.active_hash == row.hash) {
+            box.bg_color = .{ 0.2, 0.4, 0.8, 1.0 };
+        } else if (self.hot_hash_this_frame == row.hash) {
+            box.bg_color = .{ 0.3, 0.5, 0.9, 1.0 };
+        } else {
+            box.bg_color = .{ 0.15, 0.25, 0.45, 1.0 };
+        }
+
+        // Draw the inner circle if this is the currently active value
+        if (active_value.* == this_value) {
+            var dot = self.pushBox("dot", BoxFlags{ .draw_background = true });
+            dot.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
+            dot.bg_color = .{ 1.0, 1.0, 1.0, 1.0 };
+            dot.corner_radius = 6.0; // Half of the 12x12 inner size
+            self.popBox();
+        }
+        self.popBox();
+
+        self.label(text);
+
+        if (self.active_hash == row.hash and self.input.mouse_left_released and self.hot_hash_this_frame == row.hash) {
+            if (active_value.* != this_value) {
+                active_value.* = this_value;
+                changed = true;
+            }
+        }
+
+        self.popBox();
+        return changed;
     }
 };
 
@@ -1069,7 +1162,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     }
 
     // --- INVISIBLE SPACER ---
-    var spacer = ui.pushBox("Spacer", BoxFlags{});
+    var spacer = ui.pushBox("Spacer1", BoxFlags{});
     spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
     ui.popBox();
 
@@ -1077,6 +1170,27 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     if (ui.button("Decrement", .{})) {
         counter -= 1;
     }
+
+    spacer = ui.pushBox("Spacer2", BoxFlags{});
+    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    ui.popBox();
+
+    ui.label("Settings");
+
+    // Checkboxes
+    _ = ui.checkbox("Enable VSync", &vsync_enabled);
+    _ = ui.checkbox("Show Debug Stats", &show_debug);
+
+    // Spacer
+    spacer = ui.pushBox("Spacer3", BoxFlags{});
+    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    ui.popBox();
+
+    // Radio Buttons
+    ui.label("Graphics Quality:");
+    _ = ui.radioButton("Low", &graphics_quality, 0);
+    _ = ui.radioButton("Medium", &graphics_quality, 1);
+    _ = ui.radioButton("Ultra", &graphics_quality, 2);
 
     ui.popBox();
 
