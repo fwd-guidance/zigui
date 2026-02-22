@@ -15,6 +15,7 @@ var counter: i32 = 0;
 var vsync_enabled: bool = true;
 var show_debug: bool = false;
 var graphics_quality: usize = 1; // 0=Low, 1=Medium, 2=High
+var master_volume: f32 = 0.5;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -141,17 +142,21 @@ pub const UI = struct {
     hot_hash_this_frame: u64 = 0,
     active_hash: u64 = 0,
 
+    layout_cache: std.AutoHashMap(u64, [4]f32),
+
     pub fn init(allocator: std.mem.Allocator) !UI {
         return UI{
             .allocator = allocator,
             .frame_arena = std.heap.ArenaAllocator.init(allocator),
             .retained_state = std.AutoHashMap(u64, BoxState).init(allocator),
+            .layout_cache = std.AutoHashMap(u64, [4]f32).init(allocator),
         };
     }
 
     pub fn deinit(self: *UI) void {
         self.retained_state.deinit();
         self.frame_arena.deinit();
+        self.layout_cache.deinit();
     }
 
     fn generateId(self: *UI, string_id: []const u8) u64 {
@@ -363,13 +368,25 @@ pub const UI = struct {
             // 2. Resolve percentages now that we know our own size
             for (0..2) |axis| {
                 if (child.pref_size[axis].kind == .percent_of_parent) {
-                    const available = node.calculated_size[axis] - (node.padding * 2.0);
+                    var available = node.calculated_size[axis] - (node.padding * 2.0);
+
+                    // Shrink available space based on siblings that already rendered!
+                    if (node.flags.layout_horizontal and axis == 0) {
+                        available = (node.rect.pos[0] + node.calculated_size[0] - node.padding) - cursor_x;
+                    } else if (!node.flags.layout_horizontal and axis == 1) {
+                        available = (node.rect.pos[1] + node.calculated_size[1] - node.padding) - cursor_y;
+                    }
+
+                    available = @max(0.0, available); // Prevent negative sizes
+
                     child.calculated_size[axis] = available * (child.pref_size[axis].value / 100.0);
                 }
             }
 
             // 3. Position the child
             child.rect.pos = .{ cursor_x, cursor_y };
+
+            self.layout_cache.put(child.hash, .{ child.rect.pos[0], child.rect.pos[1], child.calculated_size[0], child.calculated_size[1] }) catch {};
 
             // 4. Inherit clip rects (prevents children from drawing outside their parents)
             child.clip_rect = .{
@@ -607,6 +624,75 @@ pub const UI = struct {
         }
 
         self.popBox();
+        return changed;
+    }
+
+    pub fn slider(self: *UI, text: []const u8, value: *f32, min_val: f32, max_val: f32) bool {
+        var changed = false;
+
+        // 1. The outer row container
+        var row = self.pushBox(text, BoxFlags{ .layout_horizontal = true });
+        row.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .children_sum, .value = 0.0 } };
+        row.gap = 15.0;
+
+        // 2. Format the dynamic label text using the Frame Arena!
+        // We cannot use a local stack buffer like bufPrint here because this function
+        // returns immediately, destroying the stack memory before endFrame renders it.
+        const display_text = std.fmt.allocPrint(self.frame_arena.allocator(), "{s}: {d:.2}", .{ text, value.* }) catch text;
+
+        // Label on the left
+        var label_box = self.pushBox("label", BoxFlags{});
+        label_box.text = display_text;
+        label_box.pref_size = .{ .{ .kind = .text_content, .value = 0.0 }, .{ .kind = .pixels, .value = 32.0 } };
+        self.popBox();
+
+        // 3. The interactive track
+        var track = self.pushBox("track", BoxFlags{ .clickable = true, .draw_background = true });
+        track.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 32.0 } };
+        track.corner_radius = 6.0;
+        track.bg_color = .{ 0.1, 0.1, 0.15, 1.0 }; // Dark track background
+
+        // --- THE SLIDER MATH ---
+        if (self.active_hash == track.hash) {
+            // Read the cached dimensions from the previous frame!
+            if (self.layout_cache.get(track.hash)) |cached_rect| {
+                const track_x = cached_rect[0];
+                const track_w = cached_rect[2];
+
+                if (track_w > 0.0) {
+                    var t = (self.input.mouse_x - track_x) / track_w;
+                    t = @max(0.0, @min(1.0, t)); // Clamp
+
+                    const new_val = min_val + t * (max_val - min_val);
+                    if (value.* != new_val) {
+                        value.* = new_val;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // -----------------------
+
+        // 4. The colored Fill portion inside the track
+        const fill_pct = (value.* - min_val) / (max_val - min_val);
+
+        var fill = self.pushBox("fill", BoxFlags{ .draw_background = true });
+        fill.pref_size = .{ .{ .kind = .percent_of_parent, .value = fill_pct * 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
+        fill.corner_radius = 6.0;
+
+        // Smooth interaction colors
+        if (self.active_hash == track.hash) {
+            fill.bg_color = .{ 0.3, 0.6, 1.0, 1.0 }; // Active Blue
+        } else if (self.hot_hash_this_frame == track.hash) {
+            fill.bg_color = .{ 0.4, 0.7, 1.0, 1.0 }; // Hover Blue
+        } else {
+            fill.bg_color = .{ 0.2, 0.5, 0.9, 1.0 }; // Idle Blue
+        }
+
+        self.popBox(); // pop fill
+        self.popBox(); // pop track
+        self.popBox(); // pop row
+
         return changed;
     }
 };
@@ -1191,6 +1277,20 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     _ = ui.radioButton("Low", &graphics_quality, 0);
     _ = ui.radioButton("Medium", &graphics_quality, 1);
     _ = ui.radioButton("Ultra", &graphics_quality, 2);
+
+    spacer = ui.pushBox("Spacer4", BoxFlags{});
+    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    ui.popBox();
+
+    ui.label("Audio");
+
+    // The Slider!
+    if (ui.slider("Master Volume", &master_volume, 0.0, 1.0)) {
+        // This block fires every frame the value is actively changing
+        // You can use this to update your audio engine in real-time
+        //std.debug.print("Volume changed to: {d:.2}\n", .{master_volume});
+
+    }
 
     ui.popBox();
 
