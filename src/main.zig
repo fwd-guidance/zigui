@@ -251,11 +251,11 @@ pub const UI = struct {
     }
 
     // --- Layout Algorithms ---
-    pub fn endFrame(self: *UI, app: *AppState) void {
+    pub fn endFrame(self: *UI, app: *AppState, window_width: f32, window_height: f32) void {
         if (self.root) |root| {
             // Screen Bounds setup
-            root.rect.size = .{ 800.0, 600.0 }; // Should match window
-            root.clip_rect = .{ 0.0, 0.0, 800.0, 600.0 };
+            root.rect.size = .{ window_width, window_height }; // Should match window
+            root.clip_rect = .{ 0.0, 0.0, window_width, window_height };
 
             self.computeSizeBottomUp(root);
             self.computeLayoutTopDown(root, 0.0, 0.0);
@@ -456,12 +456,12 @@ const wgsl_shader =
     \\
     \\ @group(0) @binding(0) var font_tex: texture_2d<f32>;
     \\ @group(0) @binding(1) var font_sampler: sampler;
+    \\ @group(0) @binding(2) var<uniform> screen_size: vec2<f32>;
     \\
     \\ @vertex fn vs_main(model: VertexInput, instance: InstanceInput) -> VertexOutput {
     \\     var out: VertexOutput;
     \\     out.uv = model.pos;
     \\     let pixel_pos = instance.rect_pos + (model.pos * instance.rect_size);
-    \\     let screen_size = vec2<f32>(800.0, 600.0);
     \\     let ndc_x = (pixel_pos.x / screen_size.x) * 2.0 - 1.0;
     \\     let ndc_y = 1.0 - (pixel_pos.y / screen_size.y) * 2.0;
     \\     out.clip_pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
@@ -512,6 +512,7 @@ const AppState = struct {
     vbo: c.WGPUBuffer,
     ibo: c.WGPUBuffer,
     font: Font,
+    screen_uniform_buf: c.WGPUBuffer,
 
     const Self = @This();
 
@@ -529,6 +530,20 @@ const AppState = struct {
         const adapter = requestAdapter(instance, surface);
         const device = requestDevice(adapter);
         const queue = c.wgpuDeviceGetQueue(device);
+
+        // Create Uniform Buffer for Screen Size
+        const uniform_desc = c.WGPUBufferDescriptor{
+            .nextInChain = null,
+            .label = empty_label,
+            .usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst,
+            .size = @sizeOf([2]f32),
+            .mappedAtCreation = 0,
+        };
+        const screen_uniform_buf = c.wgpuDeviceCreateBuffer(device, &uniform_desc);
+
+        // Upload initial 800x600
+        const initial_screen = [2]f32{ 800.0, 600.0 };
+        c.wgpuQueueWriteBuffer(queue, screen_uniform_buf, 0, &initial_screen, @sizeOf([2]f32));
 
         // 1. Bake the Font
         const ttf_file = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "font.otf", 1024 * 1024 * 10);
@@ -599,6 +614,7 @@ const AppState = struct {
         var bgl_entries = [_]c.WGPUBindGroupLayoutEntry{
             std.mem.zeroes(c.WGPUBindGroupLayoutEntry),
             std.mem.zeroes(c.WGPUBindGroupLayoutEntry),
+            std.mem.zeroes(c.WGPUBindGroupLayoutEntry),
         };
 
         // Entry 0: The Texture
@@ -611,6 +627,11 @@ const AppState = struct {
         bgl_entries[1].binding = 1;
         bgl_entries[1].visibility = c.WGPUShaderStage_Fragment;
         bgl_entries[1].sampler.type = c.WGPUSamplerBindingType_Filtering;
+
+        bgl_entries[2].binding = 2;
+        bgl_entries[2].visibility = c.WGPUShaderStage_Vertex;
+        bgl_entries[2].buffer.type = c.WGPUBufferBindingType_Uniform;
+        bgl_entries[2].buffer.minBindingSize = @sizeOf([2]f32);
 
         const bgl_desc = c.WGPUBindGroupLayoutDescriptor{
             .nextInChain = null,
@@ -627,6 +648,7 @@ const AppState = struct {
         var bg_entries = [_]c.WGPUBindGroupEntry{
             std.mem.zeroes(c.WGPUBindGroupEntry),
             std.mem.zeroes(c.WGPUBindGroupEntry),
+            std.mem.zeroes(c.WGPUBindGroupEntry),
         };
 
         bg_entries[0].binding = 0;
@@ -634,6 +656,11 @@ const AppState = struct {
 
         bg_entries[1].binding = 1;
         bg_entries[1].sampler = font_sampler;
+
+        bg_entries[2].binding = 2;
+        bg_entries[2].buffer = screen_uniform_buf;
+        bg_entries[2].offset = 0;
+        bg_entries[2].size = @sizeOf([2]f32);
 
         const bg_desc = c.WGPUBindGroupDescriptor{
             .nextInChain = null,
@@ -820,6 +847,7 @@ const AppState = struct {
             .vbo = vbo,
             .ibo = ibo,
             .font = font,
+            .screen_uniform_buf = screen_uniform_buf,
         };
     }
 
@@ -838,20 +866,24 @@ const AppState = struct {
         c.RGFW_window_close(self.window);
     }
 
-    pub fn configureSurface(self: *Self) void {
+    pub fn configureSurface(self: *Self, width: u32, height: u32) void {
         const surface_config = c.WGPUSurfaceConfiguration{
             .nextInChain = null,
             .device = self.device,
             .format = self.surface_format,
             .usage = c.WGPUTextureUsage_RenderAttachment,
-            .width = 800,
-            .height = 600,
+            .width = width,
+            .height = height,
             .presentMode = c.WGPUPresentMode_Fifo,
             .alphaMode = c.WGPUCompositeAlphaMode_Auto,
             .viewFormatCount = 0,
             .viewFormats = null,
         };
         c.wgpuSurfaceConfigure(self.surface, &surface_config);
+
+        // Sync the shader uniform with the new dimensions
+        const new_size = [2]f32{ @floatFromInt(width), @floatFromInt(height) };
+        c.wgpuQueueWriteBuffer(self.queue, self.screen_uniform_buf, 0, &new_size, @sizeOf([2]f32));
     }
 
     pub fn renderUI(self: *Self, instances: []const InstanceData) void {
@@ -924,7 +956,10 @@ pub fn main() !void {
 
     var app = try AppState.init();
     defer app.deinit();
-    app.configureSurface();
+
+    var window_width: u32 = 800;
+    var window_height: u32 = 600;
+    app.configureSurface(window_width, window_height);
 
     var ui = try UI.init(gpa.allocator());
     defer ui.deinit();
@@ -944,6 +979,18 @@ pub fn main() !void {
         var event: c.RGFW_event = undefined;
         while (c.RGFW_window_checkEvent(app.window, &event) != 0) {
             switch (event.type) {
+                c.RGFW_windowResized => {
+                    var w: c_int = 0;
+                    var h: c_int = 0;
+
+                    _ = c.RGFW_window_getSize(app.window, &w, &h);
+                    // RGFW updates the window struct dimensions automatically
+                    window_width = @intCast(w);
+                    window_height = @intCast(h);
+
+                    // Rebuild the swapchain immediately!
+                    app.configureSurface(window_width, window_height);
+                },
                 c.RGFW_mousePosChanged => {
                     // Update mouse position (cast from integer to f32)
                     current_input.mouse_x = @floatFromInt(event.mouse.x);
@@ -1004,7 +1051,7 @@ pub fn main() !void {
         ui.popBox();
 
         // 4. Layout & Render Frame
-        ui.endFrame(&app);
+        ui.endFrame(&app, @floatFromInt(window_width), @floatFromInt(window_height));
     }
 }
 
