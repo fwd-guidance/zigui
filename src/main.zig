@@ -18,12 +18,17 @@ pub const Rect = struct {
     size: [2]f32 = .{ 0.0, 0.0 },
 };
 
-pub const SizeKind = enum { pixels, percent_of_parent, children_sum };
+pub const SizeKind = enum { pixels, percent_of_parent, text_content, children_sum };
 
-pub const Size = struct {
-    kind: SizeKind,
-    value: f32,
+pub const SizeConstraint = struct {
+    kind: SizeKind = .pixels,
+    value: f32 = 0.0,
 };
+
+//pub const Size = struct {
+//    kind: SizeKind,
+//    value: f32,
+//};
 
 pub const BoxFlags = packed struct {
     clickable: bool = false,
@@ -33,6 +38,8 @@ pub const BoxFlags = packed struct {
     floating: bool = false,
     _padding: u11 = 0,
 };
+
+pub const TextAlign = enum { left, center, right };
 
 pub const Box = struct {
     // Tree Links
@@ -46,7 +53,6 @@ pub const Box = struct {
     flags: BoxFlags,
     z_index: u32 = 0,
 
-    pref_size: [2]Size = .{ .{ .kind = .children_sum, .value = 0.0 }, .{ .kind = .children_sum, .value = 0.0 } },
     rect: Rect = .{},
     clip_rect: [4]f32 = .{ 0.0, 0.0, 10000.0, 10000.0 }, // minX, minY, maxX, maxY
 
@@ -57,6 +63,11 @@ pub const Box = struct {
     hot_t: f32 = 0.0,
     active_t: f32 = 0.0,
     text: []const u8 = "",
+    text_align: TextAlign = .left,
+    pref_size: [2]SizeConstraint = .{ .{}, .{} },
+    calculated_size: [2]f32 = .{ 0.0, 0.0 },
+    padding: f32 = 0.0,
+    gap: f32 = 0.0,
 };
 
 pub const BoxState = struct {
@@ -97,6 +108,12 @@ pub const Font = struct {
     cdata: [96]c.stbtt_bakedchar, // ASCII characters 32 through 126
     texture: c.WGPUTexture,
     bind_group: c.WGPUBindGroup,
+};
+
+pub const ButtonTheme = struct {
+    base: [4]f32 = .{ 0.2, 0.2, 0.2, 1.0 },
+    hover: [4]f32 = .{ 1.0, 0.0, 0.0, 1.0 },
+    active: [4]f32 = .{ 0.0, 0.0, 1.0, 1.0 },
 };
 
 const AppContext = struct {
@@ -248,11 +265,7 @@ pub const UI = struct {
                     self.active_hash = hash;
                 }
             }
-            //if (self.active_hash == hash and !self.input.mouse_left_down) {
-            //    self.active_hash = 0;
-            //}
         }
-
         return box;
     }
 
@@ -263,14 +276,16 @@ pub const UI = struct {
     // --- Layout Algorithms ---
     pub fn endFrame(self: *UI, app: *AppState, window_width: f32, window_height: f32) void {
         if (self.root) |root| {
-            // Screen Bounds setup
-            root.rect.size = .{ window_width, window_height }; // Should match window
+            // Force the root container to exactly match the OS window
+            root.pref_size = .{ .{ .kind = .pixels, .value = window_width }, .{ .kind = .pixels, .value = window_height } };
+            root.rect.pos = .{ 0.0, 0.0 };
             root.clip_rect = .{ 0.0, 0.0, window_width, window_height };
 
-            self.computeSizeBottomUp(root);
-            self.computeLayoutTopDown(root, 0.0, 0.0);
+            // Execute the Solver
+            self.computeSizes(root);
+            self.computeLayout(root);
 
-            // Cache final state and generate draw commands
+            // Extract the draw commands based on the solved boxes
             var instances = std.ArrayList(InstanceData){};
             defer instances.deinit(self.allocator);
 
@@ -279,69 +294,168 @@ pub const UI = struct {
         }
     }
 
-    fn computeSizeBottomUp(self: *UI, node: *Box) void {
-        var child_opt = node.first;
-        while (child_opt) |child| : (child_opt = child.next) {
-            self.computeSizeBottomUp(child);
+    fn computeSizes(self: *UI, node: *Box) void {
+        // 1. Recurse deepest children FIRST (Bottom-Up)
+        var child_it = node.first;
+        while (child_it) |child| : (child_it = child.next) {
+            self.computeSizes(child);
         }
 
+        // 2. Compute our own requested size
         for (0..2) |axis| {
             switch (node.pref_size[axis].kind) {
-                .pixels => node.rect.size[axis] = node.pref_size[axis].value,
-                .children_sum => {
-                    var total: f32 = 0.0;
-                    var max: f32 = 0.0;
-                    var iter = node.first;
-                    while (iter) |b| : (iter = b.next) {
-                        if (!b.flags.floating) {
-                            total += b.rect.size[axis];
-                            max = @max(max, b.rect.size[axis]);
-                        }
-                    }
-                    const is_layout_axis = (axis == 0 and node.flags.layout_horizontal) or
-                        (axis == 1 and !node.flags.layout_horizontal);
-                    node.rect.size[axis] = if (is_layout_axis) total else max;
+                .pixels => node.calculated_size[axis] = node.pref_size[axis].value,
+
+                .text_content => {
+                    // A fast estimation. For pixel-perfect boxes, you would run
+                    // STB quad logic here to get the exact bounding box.
+                    if (axis == 0) node.calculated_size[0] = @as(f32, @floatFromInt(node.text.len)) * 16.0;
+                    if (axis == 1) node.calculated_size[1] = 32.0;
                 },
-                .percent_of_parent => {}, // Handled top-down
+
+                .children_sum => {
+                    var sum: f32 = 0;
+                    var max: f32 = 0;
+                    var count: f32 = 0;
+
+                    var it = node.first;
+                    const is_row = node.flags.layout_horizontal;
+                    const main_axis: usize = if (is_row) 0 else 1;
+
+                    while (it) |b| : (it = b.next) {
+                        if (axis == main_axis) {
+                            sum += b.calculated_size[axis];
+                        } else {
+                            max = @max(max, b.calculated_size[axis]);
+                        }
+                        count += 1.0;
+                    }
+
+                    // Add gaps between elements and padding around the container
+                    if (axis == main_axis) {
+                        if (count > 1.0) sum += (count - 1.0) * node.gap;
+                        sum += node.padding * 2.0;
+                        node.calculated_size[axis] = sum;
+                    } else {
+                        max += node.padding * 2.0;
+                        node.calculated_size[axis] = max;
+                    }
+                },
+
+                .percent_of_parent => {
+                    // We cannot solve percentages until the parent's size is locked.
+                    // Leave it at 0; it will be solved in Pass 2.
+                    node.calculated_size[axis] = 0;
+                },
             }
         }
     }
 
-    fn computeLayoutTopDown(self: *UI, node: *Box, start_x: f32, start_y: f32) void {
-        node.rect.pos = .{ start_x, start_y };
-        var cursor_x = start_x;
-        var cursor_y = start_y;
+    fn computeLayout(self: *UI, node: *Box) void {
+        // 1. Lock in the final size
+        node.rect.size = node.calculated_size;
 
-        var children_clip = node.clip_rect;
-        if (node.flags.clip_children) {
-            children_clip[0] = @max(children_clip[0], node.rect.pos[0]);
-            children_clip[1] = @max(children_clip[1], node.rect.pos[1]);
-            children_clip[2] = @min(children_clip[2], node.rect.pos[0] + node.rect.size[0]);
-            children_clip[3] = @min(children_clip[3], node.rect.pos[1] + node.rect.size[1]);
-        }
+        // Start the layout cursor at the top-left, inset by padding
+        var cursor_x = node.rect.pos[0] + node.padding;
+        var cursor_y = node.rect.pos[1] + node.padding;
 
-        var child_opt = node.first;
-        while (child_opt) |child| : (child_opt = child.next) {
+        var child_it = node.first;
+        while (child_it) |child| : (child_it = child.next) {
+
+            // 2. Resolve percentages now that we know our own size
             for (0..2) |axis| {
                 if (child.pref_size[axis].kind == .percent_of_parent) {
-                    child.rect.size[axis] = node.rect.size[axis] * (child.pref_size[axis].value / 100.0);
+                    const available = node.calculated_size[axis] - (node.padding * 2.0);
+                    child.calculated_size[axis] = available * (child.pref_size[axis].value / 100.0);
                 }
             }
 
-            if (child.flags.floating) {
-                child.clip_rect = .{ 0.0, 0.0, 800.0, 600.0 }; // Escape clipping
-                self.computeLayoutTopDown(child, start_x, start_y);
+            // 3. Position the child
+            child.rect.pos = .{ cursor_x, cursor_y };
+
+            // 4. Inherit clip rects (prevents children from drawing outside their parents)
+            child.clip_rect = .{
+                @max(node.clip_rect[0], child.rect.pos[0]),
+                @max(node.clip_rect[1], child.rect.pos[1]),
+                @min(node.clip_rect[2], child.rect.pos[0] + child.calculated_size[0]),
+                @min(node.clip_rect[3], child.rect.pos[1] + child.calculated_size[1]),
+            };
+
+            // 5. Advance the cursor for the next sibling
+            if (node.flags.layout_horizontal) {
+                cursor_x += child.calculated_size[0] + node.gap;
             } else {
-                child.clip_rect = children_clip;
-                self.computeLayoutTopDown(child, cursor_x, cursor_y);
-                if (node.flags.layout_horizontal) {
-                    cursor_x += child.rect.size[0];
-                } else {
-                    cursor_y += child.rect.size[1];
-                }
+                cursor_y += child.calculated_size[1] + node.gap;
             }
+
+            // 6. Recurse down the tree
+            self.computeLayout(child);
         }
     }
+
+    //fn computeSizeBottomUp(self: *UI, node: *Box) void {
+    //    var child_opt = node.first;
+    //    while (child_opt) |child| : (child_opt = child.next) {
+    //        self.computeSizeBottomUp(child);
+    //    }
+
+    //    for (0..2) |axis| {
+    //        switch (node.pref_size[axis].kind) {
+    //            .pixels => node.rect.size[axis] = node.pref_size[axis].value,
+    //            .children_sum => {
+    //                var total: f32 = 0.0;
+    //                var max: f32 = 0.0;
+    //                var iter = node.first;
+    //                while (iter) |b| : (iter = b.next) {
+    //                    if (!b.flags.floating) {
+    //                        total += b.rect.size[axis];
+    //                        max = @max(max, b.rect.size[axis]);
+    //                    }
+    //                }
+    //                const is_layout_axis = (axis == 0 and node.flags.layout_horizontal) or
+    //                    (axis == 1 and !node.flags.layout_horizontal);
+    //                node.rect.size[axis] = if (is_layout_axis) total else max;
+    //            },
+    //            .percent_of_parent => {}, // Handled top-down
+    //        }
+    //    }
+    //}
+
+    //fn computeLayoutTopDown(self: *UI, node: *Box, start_x: f32, start_y: f32) void {
+    //    node.rect.pos = .{ start_x, start_y };
+    //    var cursor_x = start_x;
+    //    var cursor_y = start_y;
+
+    //    var children_clip = node.clip_rect;
+    //    if (node.flags.clip_children) {
+    //        children_clip[0] = @max(children_clip[0], node.rect.pos[0]);
+    //        children_clip[1] = @max(children_clip[1], node.rect.pos[1]);
+    //        children_clip[2] = @min(children_clip[2], node.rect.pos[0] + node.rect.size[0]);
+    //        children_clip[3] = @min(children_clip[3], node.rect.pos[1] + node.rect.size[1]);
+    //    }
+
+    //    var child_opt = node.first;
+    //    while (child_opt) |child| : (child_opt = child.next) {
+    //        for (0..2) |axis| {
+    //            if (child.pref_size[axis].kind == .percent_of_parent) {
+    //                child.rect.size[axis] = node.rect.size[axis] * (child.pref_size[axis].value / 100.0);
+    //            }
+    //        }
+
+    //        if (child.flags.floating) {
+    //            child.clip_rect = .{ 0.0, 0.0, 800.0, 600.0 }; // Escape clipping
+    //            self.computeLayoutTopDown(child, start_x, start_y);
+    //        } else {
+    //            child.clip_rect = children_clip;
+    //            self.computeLayoutTopDown(child, cursor_x, cursor_y);
+    //            if (node.flags.layout_horizontal) {
+    //                cursor_x += child.rect.size[0];
+    //            } else {
+    //                cursor_y += child.rect.size[1];
+    //            }
+    //        }
+    //    }
+    //}
 
     fn buildRenderCommands(self: *UI, node: *Box, instances: *std.ArrayList(InstanceData), font: *Font) void {
         // Cache state for next frame
@@ -365,18 +479,36 @@ pub const UI = struct {
             }) catch unreachable;
         }
 
-        // Draw Background (Existing logic) ...
-
         // Draw Text
         if (node.text.len > 0) {
-            var cursor_x = node.rect.pos[0];
-            var cursor_y = node.rect.pos[1] + 24.0; // Offset by baseline
-
+            // 1. Measure the exact pixel width of the string
+            var text_width: f32 = 0.0;
+            var dummy_y: f32 = 0.0;
             for (node.text) |char| {
                 if (char >= 32 and char < 128) {
                     var q: c.stbtt_aligned_quad = undefined;
-                    // This STB function calculates the exact pos and UVs for this character
-                    c.stbtt_GetBakedQuad(&font.cdata, 512, 512, char - 32, &cursor_x, &cursor_y, &q, 1);
+                    // We just use this to advance the text_width variable
+                    c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
+                }
+            }
+
+            // 2. Calculate the starting X position based on alignment
+            var cursor_x: f32 = node.rect.pos[0];
+            switch (node.text_align) {
+                .center => cursor_x += (node.rect.size[0] - text_width) / 2.0,
+                .right => cursor_x += (node.rect.size[0] - text_width) - node.padding,
+                .left => cursor_x += node.padding, // Add a little padding so it doesn't touch the left wall
+            }
+
+            // 3. Center the text vertically
+            // (Assuming a ~32px font, the baseline is usually offset down by about a quarter of the line height)
+            var cursor_y = node.rect.pos[1] + (node.rect.size[1] / 2.0) + 8.0;
+
+            // 4. Actually draw the quads
+            for (node.text) |char| {
+                if (char >= 32 and char < 128) {
+                    var q: c.stbtt_aligned_quad = undefined;
+                    c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
 
                     instances.append(self.allocator, InstanceData{
                         .rect_pos = .{ q.x0, q.y0 },
@@ -385,7 +517,7 @@ pub const UI = struct {
                         .clip_rect = node.clip_rect,
                         .corner_radius = 0.0,
                         .edge_softness = 0.0,
-                        .type_flag = 1, // Flag as text
+                        .type_flag = 1,
                         .uv_min = .{ q.s0, q.t0 },
                         .uv_max = .{ q.s1, q.t1 },
                     }) catch unreachable;
@@ -400,24 +532,21 @@ pub const UI = struct {
     }
 
     // --- High Level API ---
-    pub fn button(self: *UI, text: []const u8) bool {
+    pub fn button(self: *UI, text: []const u8, theme: ButtonTheme) bool {
         var box = self.pushBox(text, BoxFlags{ .clickable = true, .draw_background = true });
 
         box.text = text;
+        box.text_align = .center;
         box.pref_size = .{ .{ .kind = .pixels, .value = 150.0 }, .{ .kind = .pixels, .value = 40.0 } };
-        box.corner_radius = 8.0;
-
-        // Smooth color interpolation based on animated state
-        const base_color = [4]f32{ 0.2, 0.2, 0.2, 1.0 };
-        const hover_color = [4]f32{ 1.0, 0.0, 0.0, 1.0 };
-        const active_color = [4]f32{ 0.0, 0.0, 1.0, 1.0 };
+        box.corner_radius = 0.0;
 
         // Blend colors using the _t values!
         for (0..3) |i| {
-            box.bg_color[i] = base_color[i] +
-                (hover_color[i] - base_color[i]) * box.hot_t +
-                (active_color[i] - hover_color[i]) * box.active_t;
+            box.bg_color[i] = theme.base[i] +
+                (theme.hover[i] - theme.base[i]) * box.hot_t +
+                (theme.active[i] - theme.hover[i]) * box.active_t;
         }
+        box.bg_color[3] = theme.base[3]; // Keep alpha consistent
 
         self.popBox();
         return self.active_hash == box.hash and self.input.mouse_left_released and self.hot_hash_this_frame == box.hash;
@@ -432,6 +561,29 @@ pub const UI = struct {
         box.pref_size = .{ .{ .kind = .pixels, .value = @as(f32, @floatFromInt(text.len)) * 16.0 }, .{ .kind = .pixels, .value = 32.0 } };
 
         self.popBox();
+    }
+
+    pub fn buttonFullWidth(self: *UI, text: []const u8, theme: ButtonTheme) bool {
+        var box = self.pushBox(text, BoxFlags{ .clickable = true, .draw_background = true });
+
+        box.text = text;
+        box.text_align = .center;
+
+        // Width: 100% of available parent space. Height: 40 pixels.
+        box.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 40.0 } };
+
+        box.corner_radius = 0.0;
+
+        // Your exact interpolation math, now driven by the theme!
+        for (0..3) |i| {
+            box.bg_color[i] = theme.base[i] +
+                (theme.hover[i] - theme.base[i]) * box.hot_t +
+                (theme.active[i] - theme.hover[i]) * box.active_t;
+        }
+        box.bg_color[3] = theme.base[3]; // Keep alpha consistent
+
+        self.popBox();
+        return self.active_hash == box.hash and self.input.mouse_left_released and self.hot_hash_this_frame == box.hash;
     }
 };
 
@@ -619,8 +771,6 @@ const AppState = struct {
         defer c.wgpuSamplerRelease(font_sampler);
 
         // --- 4. Define the Bind Group Layout (The "Contract") ---
-        //var bgl_entries = [_]c.WGPUBindGroupLayoutEntry{std.mem.zeroes(c.WGPUBindGroupLayoutEntry) ** 2};
-        // --- 4. Define the Bind Group Layout (The "Contract") ---
         var bgl_entries = [_]c.WGPUBindGroupLayoutEntry{
             std.mem.zeroes(c.WGPUBindGroupLayoutEntry),
             std.mem.zeroes(c.WGPUBindGroupLayoutEntry),
@@ -652,8 +802,6 @@ const AppState = struct {
         const bind_group_layout = c.wgpuDeviceCreateBindGroupLayout(device, &bgl_desc);
         defer c.wgpuBindGroupLayoutRelease(bind_group_layout);
 
-        // --- 5. Create the Actual Bind Group (The Data) ---
-        //var bg_entries = [_]c.WGPUBindGroupEntry{std.mem.zeroes(c.WGPUBindGroupEntry) ** 2};
         // --- 5. Create the Actual Bind Group (The Data) ---
         var bg_entries = [_]c.WGPUBindGroupEntry{
             std.mem.zeroes(c.WGPUBindGroupEntry),
@@ -687,11 +835,6 @@ const AppState = struct {
 
         // --- Setup UI Pipeline ---
         // 1. Shader Module
-        //const wgsl_desc = c.WGPUShaderModuleWGSLDescriptor{
-        //    .chain = .{ .next = null, .sType = c.WGPUSType_ShaderModuleWGSLDescriptor },
-        //    .code = wgsl_shader.ptr,
-        //};
-
         const wgsl_desc = c.WGPUShaderSourceWGSL{
             .chain = .{ .next = null, .sType = c.WGPUSType_ShaderSourceWGSL },
             .code = c.WGPUStringView{
@@ -728,10 +871,7 @@ const AppState = struct {
         };
         const ibo = c.wgpuDeviceCreateBuffer(device, &ibo_desc);
 
-        // 4. Pipeline Config (Skipping attribute boilerplate for brevity, map InstanceData appropriately)
-        // ... (Imagine full pipeline descriptor here connecting to shader) ...
         // 4. Pipeline Configuration
-        //const empty_label = c.WGPUStringView{ .data = null, .length = 0 };
         const vs_entry = c.WGPUStringView{ .data = "vs_main", .length = 7 };
         const fs_entry = c.WGPUStringView{ .data = "fs_main", .length = 7 };
 
@@ -865,7 +1005,6 @@ const AppState = struct {
         // Replace the entire AppState.deinit function with:
         c.wgpuBufferRelease(self.vbo);
         c.wgpuBufferRelease(self.ibo);
-        // Note: pipeline is stubbed, so we skip c.wgpuRenderPipelineRelease(self.pipeline)
         c.wgpuRenderPipelineRelease(self.pipeline);
 
         c.wgpuQueueRelease(self.queue);
@@ -954,8 +1093,6 @@ const AppState = struct {
     }
 };
 
-// ... [Include user provided requestAdapter and requestDevice functions here] ... [cite: 37, 41]
-
 // ==========================================
 // 4. MAIN LOOP
 // ==========================================
@@ -988,12 +1125,15 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     main_panel.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
     main_panel.bg_color = .{ 0.1, 0.1, 0.1, 1.0 };
 
+    main_panel.padding = 20.0;
+    main_panel.gap = 10.0;
+
     var counter_buf: [32]u8 = undefined;
     const counter_text = std.fmt.bufPrint(&counter_buf, "Counter: {d}", .{counter}) catch "Counter: Error";
 
     ui.label(counter_text);
     // --- BUTTON 1 ---
-    if (ui.button("Increment")) {
+    if (ui.buttonFullWidth("Increment", .{})) {
         counter += 1;
     }
 
@@ -1003,7 +1143,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     ui.popBox();
 
     // --- BUTTON 2 ---
-    if (ui.button("Decrement")) {
+    if (ui.buttonFullWidth("Decrement", .{})) {
         counter -= 1;
     }
 
