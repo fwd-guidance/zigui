@@ -19,6 +19,8 @@ var graphics_quality: usize = 1; // 0=Low, 1=Medium, 2=High
 var master_volume: f32 = 0.5;
 var my_text_buf: [256]u8 = undefined;
 var my_text_len: usize = 0;
+var my_dropdown_index: usize = 0;
+const dropdown_options = [_][]const u8{ "Low", "Medium", "High", "Ultra" };
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -39,6 +41,7 @@ pub const BoxFlags = packed struct {
     clip_children: bool = false,
     floating: bool = false,
     scrollable_y: bool = false,
+    is_popup: bool = false,
     _padding: u10 = 0,
 };
 
@@ -73,6 +76,8 @@ pub const Box = struct {
     gap: f32 = 0.0,
     is_focused: bool = false,
     text_cursor_index: usize = 0,
+    fixed_x: f32 = 0.0,
+    fixed_y: f32 = 0.0,
 };
 
 pub const BoxState = struct {
@@ -163,6 +168,12 @@ pub const UI = struct {
     focused_hash: u64 = 0,
     focused_cursor_index: usize = 0,
 
+    opened_dropdown_hash: u64 = 0,
+    deferred_popups: std.ArrayList(*Box),
+
+    window_width: f32 = 0.0,
+    window_height: f32 = 0.0,
+
     pub fn init(allocator: std.mem.Allocator) !UI {
         return UI{
             .allocator = allocator,
@@ -170,6 +181,7 @@ pub const UI = struct {
             .retained_state = std.AutoHashMap(u64, BoxState).init(allocator),
             .layout_cache = std.AutoHashMap(u64, [4]f32).init(allocator),
             .scroll_state = std.AutoHashMap(u64, [2]f32).init(allocator),
+            .deferred_popups = std.ArrayList(*Box){},
         };
     }
 
@@ -178,6 +190,7 @@ pub const UI = struct {
         self.frame_arena.deinit();
         self.layout_cache.deinit();
         self.scroll_state.deinit();
+        self.deferred_popups.deinit(self.allocator);
     }
 
     fn generateId(self: *UI, string_id: []const u8) u64 {
@@ -195,6 +208,7 @@ pub const UI = struct {
     }
 
     pub fn beginFrame(self: *UI, dt: f32, input: InputState) void {
+        self.deferred_popups.clearRetainingCapacity();
         _ = self.frame_arena.reset(.retain_capacity);
         self.input = input;
         self.current_frame_index += 1;
@@ -314,6 +328,13 @@ pub const UI = struct {
             defer instances.deinit(self.allocator);
 
             self.buildRenderCommands(root, &instances, &app.font);
+
+            // 2. NEW: Render popups perfectly over the top of everything else!
+            for (self.deferred_popups.items) |popup| {
+                popup.flags.is_popup = false; // Temporarily disable flag so it passes the check
+                self.buildRenderCommands(popup, &instances, &app.font);
+                popup.flags.is_popup = true; // Restore it
+            }
             app.renderUI(instances.items);
         }
     }
@@ -410,8 +431,30 @@ pub const UI = struct {
         var cursor_x = node.rect.pos[0] + node.padding;
         var cursor_y = node.rect.pos[1] + node.padding - scroll_offset;
 
+        var max_child_y = cursor_y;
+
         var child_it = node.first;
         while (child_it) |child| : (child_it = child.next) {
+            if (child.flags.is_popup) {
+                // Force absolute coordinates instead of cursor coordinates
+                child.rect.pos = .{ cursor_x, cursor_y };
+
+                // Copy literal pixel sizes over immediately
+                if (child.pref_size[0].kind == .pixels) child.calculated_size[0] = child.pref_size[0].value;
+                if (child.pref_size[1].kind == .pixels) child.calculated_size[1] = child.pref_size[1].value;
+
+                child.clip_rect = .{ 0.0, 0.0, 10000.0, 10000.0 };
+
+                // Recursively calculate the popup's children, then SKIP the flex math!
+                self.computeLayout(child);
+
+                // catch the absolute bottom edge of the popup
+                const bottom_edge = child.rect.pos[1] + child.rect.size[1];
+                if (bottom_edge > max_child_y) {
+                    max_child_y = bottom_edge;
+                }
+                continue;
+            }
 
             // 2. Resolve percentages now that we know our own size
             for (0..2) |axis| {
@@ -451,12 +494,17 @@ pub const UI = struct {
 
             // 6. Recurse down the tree
             self.computeLayout(child);
+
+            const flex_bottom = child.rect.pos[1] + child.calculated_size[1];
+            if (flex_bottom > max_child_y) {
+                max_child_y = flex_bottom;
+            }
         }
 
         // --- 3. CLAMP AND SAVE SCROLL ---
         if (node.flags.scrollable_y) {
             // Calculate actual content height based on where the cursor ended up
-            const content_height = (cursor_y + scroll_offset) - (node.rect.pos[1] + node.padding);
+            const content_height = (max_child_y + scroll_offset) - (node.rect.pos[1] + node.padding);
 
             // Save both the offset and the new height to the map
             self.scroll_state.put(node.hash, .{ scroll_offset, content_height }) catch {};
@@ -464,6 +512,12 @@ pub const UI = struct {
     }
 
     fn buildRenderCommands(self: *UI, node: *Box, instances: *std.ArrayList(InstanceData), font: *Font) void {
+        // --- DEFER POPUPS TO THE END ---
+        if (node.flags.is_popup) {
+            self.deferred_popups.append(self.allocator, node) catch {};
+            return; // Stop processing this branch! It will be drawn later.
+        }
+
         // Cache state for next frame
         if (self.retained_state.getPtr(node.hash)) |state| {
             state.last_frame_rect = node.rect;
@@ -854,6 +908,88 @@ pub const UI = struct {
         box.text = buffer[0..text_len.*];
 
         self.popBox();
+        return changed;
+    }
+
+    pub fn dropdown(self: *UI, id_str: []const u8, options: []const []const u8, selected_index: *usize) bool {
+        var changed = false;
+
+        // 1. The Main Button
+        const display_text = std.fmt.allocPrint(self.frame_arena.allocator(), "{s}: {s}", .{ id_str, options[selected_index.*] }) catch id_str;
+
+        var btn = self.pushBox(id_str, BoxFlags{ .clickable = true, .draw_background = true });
+        btn.text = display_text;
+        btn.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 36.0 } };
+
+        if (self.hot_hash_this_frame == btn.hash) {
+            btn.bg_color = .{ 0.2, 0.2, 0.25, 1.0 };
+        } else {
+            btn.bg_color = .{ 0.15, 0.15, 0.2, 1.0 };
+        }
+
+        // Toggle state
+        if (self.active_hash == btn.hash and self.input.mouse_left_released) {
+            if (self.opened_dropdown_hash == btn.hash) {
+                self.opened_dropdown_hash = 0; // Close
+            } else {
+                self.opened_dropdown_hash = btn.hash; // Open
+            }
+        }
+
+        self.popBox(); // pop btn
+        // 2. The Floating Popup Menu
+        if (self.opened_dropdown_hash == btn.hash) {
+            if (self.layout_cache.get(btn.hash)) |rect| {
+                const item_height: f32 = 32.0;
+                const padding: f32 = 8.0;
+                const total_height = (@as(f32, @floatFromInt(options.len)) * item_height) + padding;
+                var spawn_y = rect[1] + rect[2];
+
+                // If it hangs off the bottom of the window, flip it ABOVE the button!
+                if (spawn_y + total_height > self.window_height) {
+                    spawn_y = rect[1] - total_height;
+                }
+
+                var popup = self.pushBox("popup", BoxFlags{
+                    .is_popup = true, // Force absolute positioning and top-layer rendering!
+                    .draw_background = true,
+                    .layout_horizontal = false,
+                });
+
+                // Match the button's width, let height grow based on items
+                popup.pref_size = .{ .{ .kind = .pixels, .value = rect[2] }, .{ .kind = .pixels, .value = total_height } };
+                popup.bg_color = .{ 0.1, 0.1, 0.15, 1.0 };
+                popup.padding = 4.0;
+                popup.z_index = 10;
+
+                for (options, 0..) |opt, i| {
+                    var item = self.pushBox(opt, BoxFlags{ .clickable = true, .draw_background = true });
+                    item.text = opt;
+                    item.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 32.0 } };
+                    item.z_index = 10;
+
+                    if (self.hot_hash_this_frame == item.hash) {
+                        item.bg_color = .{ 0.3, 0.5, 0.9, 1.0 }; // Hover highlight
+                    } else {
+                        item.bg_color = .{ 0.1, 0.1, 0.15, 1.0 };
+                    }
+
+                    if (self.active_hash == item.hash and self.input.mouse_left_released) {
+                        selected_index.* = i;
+                        changed = true;
+                    }
+                    self.popBox(); // pop item
+                }
+                self.popBox(); // pop popup
+            }
+
+            // 3. Auto-close logic
+            // If the mouse was clicked anywhere, and it wasn't on the toggle button, close it.
+            if (self.input.mouse_left_released and self.hot_hash_this_frame != btn.hash) {
+                self.opened_dropdown_hash = 0;
+            }
+        }
+
         return changed;
     }
 };
@@ -1396,6 +1532,9 @@ fn onWindowResize(window: ?*c.RGFW_window, width: c_int, height: c_int) callconv
 fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_width: u32, window_height: u32) void {
     ui.beginFrame(dt, input);
 
+    ui.window_width = @floatFromInt(window_width);
+    ui.window_height = @floatFromInt(window_height);
+
     // --- MAIN CONTAINER ---
     var main_panel = ui.pushBox("Container", BoxFlags{ .draw_background = true, .layout_horizontal = false, .scrollable_y = true });
     main_panel.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
@@ -1459,6 +1598,11 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
 
     ui.label("Name:");
     _ = (ui.textInput("name_input", &my_text_buf, &my_text_len));
+
+    _ = (ui.dropdown("Graphics Quality", &dropdown_options, &my_dropdown_index));
+
+    ui.label("Date:");
+    _ = (ui.textInput("date_input", &my_text_buf, &my_text_len));
 
     ui.popBox();
 
