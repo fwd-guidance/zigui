@@ -24,6 +24,7 @@ var my_dropdown_index: usize = 0;
 const dropdown_options = [_][]const u8{ "Low", "Medium", "High", "Ultra" };
 var my_image: Texture = undefined;
 var image_loaded: bool = false;
+var my_graph_data: [50]f32 = undefined;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -82,6 +83,10 @@ pub const Box = struct {
     fixed_x: f32 = 0.0,
     fixed_y: f32 = 0.0,
     texture: ?Texture = null,
+
+    graph_data: ?[]const f32 = null,
+    graph_min: f32 = 0.0,
+    graph_max: f32 = 1.0,
 };
 
 pub const BoxState = struct {
@@ -680,6 +685,57 @@ pub const UI = struct {
             //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
         }
 
+        // --- DRAW LINE GRAPH SEGMENTS ---
+        if (node.graph_data) |data| {
+            if (data.len > 1) {
+                const pad: f32 = 4.0; // Extra quad padding so lines don't clip at the edges
+                const width = node.rect.size[0];
+                const height = node.rect.size[1];
+                const range = @max(0.001, node.graph_max - node.graph_min);
+                const x_step = width / @as(f32, @floatFromInt(data.len - 1));
+
+                for (0..data.len - 1) |i| {
+                    const v1 = data[i];
+                    const v2 = data[i + 1];
+
+                    // Normalize height from 0.0 to 1.0
+                    const n1 = @max(0.0, @min(1.0, (v1 - node.graph_min) / range));
+                    const n2 = @max(0.0, @min(1.0, (v2 - node.graph_min) / range));
+
+                    // Calculate P1 and P2 in absolute UI coordinates
+                    const p1_x = node.rect.pos[0] + (x_step * @as(f32, @floatFromInt(i)));
+                    const p1_y = node.rect.pos[1] + height - (n1 * height);
+                    const p2_x = node.rect.pos[0] + (x_step * @as(f32, @floatFromInt(i + 1)));
+                    const p2_y = node.rect.pos[1] + height - (n2 * height);
+
+                    // Create a bounding box that completely surrounds the line segment
+                    const min_x = @min(p1_x, p2_x);
+                    const min_y = @min(p1_y, p2_y);
+                    const max_x = @max(p1_x, p2_x);
+                    const max_y = @max(p1_y, p2_y);
+
+                    const q_pos = [2]f32{ min_x - pad, min_y - pad };
+                    const q_size = [2]f32{ (max_x - min_x) + (pad * 2.0), (max_y - min_y) + (pad * 2.0) };
+
+                    // Convert P1 and P2 into local coordinates relative to the bounding box
+                    const local_1 = [2]f32{ p1_x - q_pos[0], p1_y - q_pos[1] };
+                    const local_2 = [2]f32{ p2_x - q_pos[0], p2_y - q_pos[1] };
+
+                    instances.append(self.allocator, InstanceData{
+                        .rect_pos = q_pos,
+                        .rect_size = q_size,
+                        .color = .{ 0.2, 0.8, 0.5, 1.0 }, // Bright green line!
+                        .clip_rect = node.clip_rect, // Seamlessly respects scroll boundaries
+                        .corner_radius = 0.0,
+                        .edge_softness = 0.0,
+                        .type_flag = 3, // 3 = SDF Line Segment
+                        .uv_min = local_1, // Pass P1
+                        .uv_max = local_2, // Pass P2
+                    }) catch unreachable;
+                }
+            }
+        }
+
         var text_width: f32 = 0.0;
         if (node.text.len > 0) {
             var dummy_y: f32 = 0.0;
@@ -1148,6 +1204,22 @@ pub const UI = struct {
 
         self.popBox();
     }
+
+    pub fn graph(self: *UI, id_str: []const u8, data: []const f32, min_val: f32, max_val: f32, width: f32, height: f32) void {
+        var box = self.pushBox(id_str, BoxFlags{ .draw_background = true });
+
+        // Give the graph an explicit height, let it fill available width
+        box.pref_size = .{ .{ .kind = .pixels, .value = width }, .{ .kind = .pixels, .value = height } };
+        box.bg_color = .{ 0.05, 0.05, 0.08, 1.0 }; // Dark graph background
+        box.corner_radius = 4.0;
+
+        // Attach the data!
+        box.graph_data = data;
+        box.graph_min = min_val;
+        box.graph_max = max_val;
+
+        self.popBox();
+    }
 };
 
 // ==========================================
@@ -1177,6 +1249,8 @@ const wgsl_shader =
     \\     @location(5) clip_rect: vec4<f32>,
     \\     @location(6) type_flag: u32,
     \\     @location(7) tex_uv: vec2<f32>,
+    \\     @location(8) @interpolate(flat) raw_uv_min: vec2<f32>,
+    \\     @location(9) @interpolate(flat) raw_uv_max: vec2<f32>,
     \\ };
     \\
     \\ @group(0) @binding(0) var diffuse_tex: texture_2d<f32>;
@@ -1198,6 +1272,8 @@ const wgsl_shader =
     \\     out.clip_rect = instance.clip_rect;
     \\     out.type_flag = instance.type_flag;
     \\     out.tex_uv = mix(instance.uv_min, instance.uv_max, model.pos);
+    \\     out.raw_uv_min = instance.uv_min;
+    \\     out.raw_uv_max = instance.uv_max;
     \\     return out;
     \\ }
     \\ @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -1220,6 +1296,22 @@ const wgsl_shader =
     \\         let tex_color = textureSample(diffuse_tex, diffuse_sampler, in.tex_uv);
     \\         if (tex_color.a <= 0.01) { discard; }
     \\         return tex_color;
+    \\     } else if (in.type_flag == 3u) {
+    \\         let p = in.uv * in.box_size;
+    \\         let a = in.raw_uv_min;
+    \\         let b = in.raw_uv_max;
+    \\         
+    \\         let pa = p - a;
+    \\         let ba = b - a;
+    \\         
+    \\         let h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.0001), 0.0, 1.0);
+    \\         let d = length(pa - ba * h);
+    \\         
+    \\         let thickness = 2.0;
+    \\         let alpha = 1.0 - smoothstep(thickness - 1.0, thickness + 0.5, d);
+    \\         
+    \\         if (alpha <= 0.01) { discard; }
+    \\         return vec4<f32>(in.color.rgb, in.color.a * alpha);
     \\     } else {
     \\         let half_size = in.box_size * 0.5;
     \\         let pixel_pos = (in.uv * in.box_size) - half_size; 
@@ -1797,6 +1889,11 @@ fn onWindowResize(window: ?*c.RGFW_window, width: c_int, height: c_int) callconv
 }
 
 fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_width: u32, window_height: u32) void {
+    for (0..50) |i| {
+        const t = @as(f32, @floatFromInt(i)) * 0.2 + (@as(f32, @floatFromInt(counter)) * 0.1);
+        my_graph_data[i] = std.math.sin(t) * 50.0 + 50.0;
+    }
+
     ui.beginFrame(dt, input);
 
     ui.window_width = @floatFromInt(window_width);
@@ -1874,6 +1971,9 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     } else {
         ui.label("(Image failed to load)");
     }
+
+    ui.label("Performance Graph:");
+    ui.graph("my_chart", &my_graph_data, 0.0, 100.0, 500.0, 150.0);
 
     ui.popBox();
 
