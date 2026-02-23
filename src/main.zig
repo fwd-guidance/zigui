@@ -94,14 +94,21 @@ pub const BoxState = struct {
     last_frame_clip: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
     last_frame_z_index: u32 = 0,
     last_frame_touched: u64 = 0,
+    last_frame_submit_index: u32 = 0,
 
     clickable: bool = false,
+    scrollable_y: bool = false,
 
     // Animation states
     hot_t: f32 = 0.0,
     active_t: f32 = 0.0,
 
+    drag_offset_x: f32 = 0.0,
     drag_offset_y: f32 = 0.0,
+    window_x: f32 = 0.0,
+    window_y: f32 = 0.0,
+    window_width: f32 = 0.0,
+    window_height: f32 = 0.0,
 };
 
 pub const InstanceData = extern struct {
@@ -179,12 +186,15 @@ pub const UI = struct {
     root: ?*Box = null,
     parent_stack: [64]*Box = undefined,
     parent_stack_top: usize = 0,
+    submit_counter: u32 = 0,
 
     input: InputState = .{},
     current_frame_index: u64 = 0,
 
     hot_hash_this_frame: u64 = 0,
     active_hash: u64 = 0,
+
+    hovered_scroll_hash: u64 = 0,
 
     layout_cache: std.AutoHashMap(u64, [4]f32),
     scroll_state: std.AutoHashMap(u64, [2]f32),
@@ -237,6 +247,7 @@ pub const UI = struct {
         self.input = input;
         self.current_frame_index += 1;
         self.parent_stack_top = 0;
+        self.submit_counter = 0;
         self.root = null;
 
         if (!input.mouse_left_down and !input.mouse_left_released) {
@@ -245,14 +256,18 @@ pub const UI = struct {
 
         // 1. Z-Sorted Input Resolution
         self.hot_hash_this_frame = 0;
+        self.hovered_scroll_hash = 0;
+
         var highest_z: u32 = 0;
+        var highest_submit: u32 = 0;
+
+        var highest_scroll_z: u32 = 0;
+        var highest_scroll_submit: u32 = 0;
 
         var it = self.retained_state.iterator();
         while (it.next()) |entry| {
             const state = entry.value_ptr;
             if (state.last_frame_touched != self.current_frame_index - 1) continue;
-
-            if (!state.clickable) continue;
 
             const rx = state.last_frame_rect;
             const cx = state.last_frame_clip;
@@ -264,12 +279,95 @@ pub const UI = struct {
                 input.mouse_x <= cx[2] and input.mouse_y <= cx[3];
 
             if (in_rect and in_clip) {
-                if (self.hot_hash_this_frame == 0 or state.last_frame_z_index >= highest_z) {
-                    self.hot_hash_this_frame = entry.key_ptr.*;
-                    highest_z = state.last_frame_z_index;
+
+                // 1. Resolve Click Priority
+                if (state.clickable) {
+                    // Tie-breaker: If Z-Indexes are equal, the higher submit index wins!
+                    if (self.hot_hash_this_frame == 0 or
+                        state.last_frame_z_index > highest_z or
+                        (state.last_frame_z_index == highest_z and state.last_frame_submit_index > highest_submit))
+                    {
+                        self.hot_hash_this_frame = entry.key_ptr.*;
+                        highest_z = state.last_frame_z_index;
+                        highest_submit = state.last_frame_submit_index;
+                    }
+                }
+
+                // 2. Resolve Scroll Priority
+                if (state.scrollable_y) {
+                    if (self.hovered_scroll_hash == 0 or
+                        state.last_frame_z_index > highest_scroll_z or
+                        (state.last_frame_z_index == highest_scroll_z and state.last_frame_submit_index > highest_scroll_submit))
+                    {
+                        self.hovered_scroll_hash = entry.key_ptr.*;
+                        highest_scroll_z = state.last_frame_z_index;
+                        highest_scroll_submit = state.last_frame_submit_index;
+                    }
                 }
             }
         }
+
+        // 1. Z-Sorted Input Resolution
+        //self.hot_hash_this_frame = 0;
+        //self.hovered_scroll_hash = 0;
+        //var highest_z: u32 = 0;
+        //var highest_scroll_z: u32 = 0;
+
+        //var it = self.retained_state.iterator();
+        //while (it.next()) |entry| {
+        //    const state = entry.value_ptr;
+        //    if (state.last_frame_touched != self.current_frame_index - 1) continue;
+
+        //    const rx = state.last_frame_rect;
+        //    const cx = state.last_frame_clip;
+
+        //    const in_rect = input.mouse_x >= rx.pos[0] and input.mouse_x <= rx.pos[0] + rx.size[0] and
+        //        input.mouse_y >= rx.pos[1] and input.mouse_y <= rx.pos[1] + rx.size[1];
+
+        //    const in_clip = input.mouse_x >= cx[0] and input.mouse_y >= cx[1] and
+        //        input.mouse_x <= cx[2] and input.mouse_y <= cx[3];
+
+        //    if (in_rect and in_clip) {
+        //        // 1. Resolve Click Hover Priority
+        //        if (state.clickable) {
+        //            if (self.hot_hash_this_frame == 0 or state.last_frame_z_index >= highest_z) {
+        //                self.hot_hash_this_frame = entry.key_ptr.*;
+        //                highest_z = state.last_frame_z_index;
+        //            }
+        //        }
+        //        // 2. Resolve Scroll Hover Priority
+        //        if (state.scrollable_y) {
+        //            if (self.hovered_scroll_hash == 0 or state.last_frame_z_index >= highest_scroll_z) {
+        //                self.hovered_scroll_hash = entry.key_ptr.*;
+        //                highest_scroll_z = state.last_frame_z_index;
+        //            }
+        //        }
+        //    }
+        //}
+
+        //var it = self.retained_state.iterator();
+        //while (it.next()) |entry| {
+        //    const state = entry.value_ptr;
+        //    if (state.last_frame_touched != self.current_frame_index - 1) continue;
+
+        //    if (!state.clickable) continue;
+
+        //    const rx = state.last_frame_rect;
+        //    const cx = state.last_frame_clip;
+
+        //    const in_rect = input.mouse_x >= rx.pos[0] and input.mouse_x <= rx.pos[0] + rx.size[0] and
+        //        input.mouse_y >= rx.pos[1] and input.mouse_y <= rx.pos[1] + rx.size[1];
+
+        //    const in_clip = input.mouse_x >= cx[0] and input.mouse_y >= cx[1] and
+        //        input.mouse_x <= cx[2] and input.mouse_y <= cx[3];
+
+        //    if (in_rect and in_clip) {
+        //        if (self.hot_hash_this_frame == 0 or state.last_frame_z_index >= highest_z) {
+        //            self.hot_hash_this_frame = entry.key_ptr.*;
+        //            highest_z = state.last_frame_z_index;
+        //        }
+        //    }
+        //}
 
         // 2. Smooth Animations (Interpolate State Cache)
         it = self.retained_state.iterator();
@@ -293,6 +391,7 @@ pub const UI = struct {
         if (self.parent_stack_top > 0) {
             var parent = self.parent_stack[self.parent_stack_top - 1];
             box.parent = parent;
+            box.z_index = parent.z_index;
             if (parent.last) |last| {
                 last.next = box;
                 box.prev = last;
@@ -316,6 +415,10 @@ pub const UI = struct {
         }
         state_entry.value_ptr.last_frame_touched = self.current_frame_index;
         state_entry.value_ptr.clickable = flags.clickable;
+        state_entry.value_ptr.scrollable_y = flags.scrollable_y;
+
+        state_entry.value_ptr.last_frame_submit_index = self.submit_counter;
+        self.submit_counter += 1;
 
         box.hot_t = state_entry.value_ptr.hot_t;
         box.active_t = state_entry.value_ptr.active_t;
@@ -433,16 +536,130 @@ pub const UI = struct {
             self.buildRenderCommands(root, &instances, &draw_cmds, &current_bg, &app.font);
 
             // 2. NEW: Render popups perfectly over the top of everything else!
-            for (self.deferred_popups.items) |popup| {
-                popup.flags.is_popup = false; // Temporarily disable flag so it passes the check
+            //for (self.deferred_popups.items) |popup| {
+            //    popup.flags.is_popup = false; // Temporarily disable flag so it passes the check
+            //    self.buildRenderCommands(popup, &instances, &draw_cmds, &current_bg, &app.font);
+            //    popup.flags.is_popup = true; // Restore it
+            //}
+
+            // 2. NEW: Render popups perfectly over the top of everything else!
+            // We use a dynamic while loop so that popups spawned INSIDE of popups
+            // (like resize handles) are appended to the queue and drawn!
+            var p_i: usize = 0;
+            while (p_i < self.deferred_popups.items.len) : (p_i += 1) {
+                const popup = self.deferred_popups.items[p_i];
+
+                popup.flags.is_popup = false;
                 self.buildRenderCommands(popup, &instances, &draw_cmds, &current_bg, &app.font);
-                popup.flags.is_popup = true; // Restore it
+                popup.flags.is_popup = true;
             }
 
             var final_cmd = &draw_cmds.items[draw_cmds.items.len - 1];
             final_cmd.instance_count = @intCast(instances.items.len - final_cmd.instance_offset);
             app.renderUI(instances.items, draw_cmds.items);
         }
+    }
+
+    pub fn beginWindow(self: *UI, title: []const u8, start_x: f32, start_y: f32, start_w: f32, start_h: f32) void {
+        const hash = self.generateId(title);
+
+        // 1. Fetch or Initialize Persistent State
+        var state_entry = self.retained_state.getOrPut(hash) catch unreachable;
+        if (!state_entry.found_existing) {
+            state_entry.value_ptr.* = BoxState{};
+            state_entry.value_ptr.window_x = start_x;
+            state_entry.value_ptr.window_y = start_y;
+            state_entry.value_ptr.window_width = start_w; // Initialize width!
+            state_entry.value_ptr.window_height = start_h; // Initialize height!
+        }
+        var state = state_entry.value_ptr;
+
+        // 2. The Floating Master Container
+        var win = self.pushBox(title, BoxFlags{ .is_popup = true, .floating = true, .clickable = true, .draw_background = true, .layout_horizontal = false });
+        win.z_index = 10;
+
+        win.fixed_x = state.window_x;
+        win.fixed_y = state.window_y;
+
+        // Use the persistent width and height!
+        win.pref_size = .{ .{ .kind = .pixels, .value = state.window_width }, .{ .kind = .pixels, .value = state.window_height } };
+        win.bg_color = .{ 0.1, 0.1, 0.12, 1.0 };
+        win.corner_radius = 8.0;
+        win.padding = 2.0;
+
+        // 3. The Draggable Title Bar
+        var title_bar = self.pushBox("title_bar", BoxFlags{ .clickable = true, .draw_background = true });
+        title_bar.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 28.0 } };
+        title_bar.bg_color = .{ 0.15, 0.25, 0.45, 1.0 };
+        title_bar.corner_radius = 6.0;
+
+        self.label(title);
+
+        // --- TITLE BAR DRAG MATH ---
+        if (self.active_hash == title_bar.hash) {
+            title_bar.bg_color = .{ 0.2, 0.3, 0.5, 1.0 };
+
+            if (self.input.mouse_left_pressed) {
+                state.drag_offset_x = self.input.mouse_x - state.window_x;
+                state.drag_offset_y = self.input.mouse_y - state.window_y;
+            }
+
+            state.window_x = self.input.mouse_x - state.drag_offset_x;
+            state.window_y = self.input.mouse_y - state.drag_offset_y;
+
+            const snap_dist: f32 = 30.0;
+            if (state.window_x < snap_dist) state.window_x = 0.0;
+            if (state.window_x + state.window_width > self.window_width - snap_dist) state.window_x = self.window_width - state.window_width;
+            if (state.window_y < snap_dist) state.window_y = 0.0;
+            if (state.window_y + state.window_height > self.window_height - snap_dist) state.window_y = self.window_height - state.window_height;
+        }
+        self.popBox(); // Close Title Bar
+
+        // --- 4. THE RESIZE HANDLE ---
+        var resize_handle = self.pushBox("resize_handle", BoxFlags{ .is_popup = true, .floating = true, .clickable = true, .draw_background = true });
+
+        const handle_size = 15.0;
+        // Pin it to the absolute bottom-right corner of the window
+        resize_handle.fixed_x = state.window_x + state.window_width - handle_size;
+        resize_handle.fixed_y = state.window_y + state.window_height - handle_size;
+        resize_handle.pref_size = .{ .{ .kind = .pixels, .value = handle_size }, .{ .kind = .pixels, .value = handle_size } };
+        resize_handle.corner_radius = 4.0;
+        resize_handle.z_index = 25; // Float over the content
+
+        if (self.active_hash == resize_handle.hash) {
+            resize_handle.bg_color = .{ 0.5, 0.5, 0.5, 1.0 }; // Active color
+
+            if (self.input.mouse_left_pressed) {
+                // We can safely reuse the drag offsets for size dragging!
+                state.drag_offset_x = self.input.mouse_x - state.window_width;
+                state.drag_offset_y = self.input.mouse_y - state.window_height;
+            }
+
+            // Calculate new dimensions
+            state.window_width = self.input.mouse_x - state.drag_offset_x;
+            state.window_height = self.input.mouse_y - state.drag_offset_y;
+
+            // Clamp to a minimum window size so it doesn't collapse!
+            state.window_width = @max(150.0, state.window_width);
+            state.window_height = @max(100.0, state.window_height);
+        } else if (self.hot_hash_this_frame == resize_handle.hash) {
+            resize_handle.bg_color = .{ 0.4, 0.4, 0.4, 0.8 }; // Hover color
+        } else {
+            resize_handle.bg_color = .{ 1.0, 0.0, 0.0, 1.0 }; // Idle subtle color
+        }
+        self.popBox(); // Close Resize Handle
+        // ----------------------------
+
+        // 5. The Content Area
+        var content = self.pushBox("content", BoxFlags{ .scrollable_y = true });
+        content.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
+        content.padding = 10.0;
+        content.gap = 10.0;
+    }
+
+    pub fn endWindow(self: *UI) void {
+        self.popBox(); // Close Content Area
+        self.popBox(); // Close Master Container
     }
 
     fn computeSizes(self: *UI, node: *Box) void {
@@ -520,12 +737,17 @@ pub const UI = struct {
             }
 
             // Read input
-            if (self.layout_cache.get(node.hash)) |rect| {
-                const mx = self.input.mouse_x;
-                const my = self.input.mouse_y;
-                if (mx >= rect[0] and mx <= rect[0] + rect[2] and my >= rect[1] and my <= rect[1] + rect[3]) {
-                    scroll_offset -= self.input.scroll_y * 20.0;
-                }
+            //if (self.layout_cache.get(node.hash)) |rect| {
+            //    const mx = self.input.mouse_x;
+            //    const my = self.input.mouse_y;
+            //    if (mx >= rect[0] and mx <= rect[0] + rect[2] and my >= rect[1] and my <= rect[1] + rect[3]) {
+            //        scroll_offset -= self.input.scroll_y * 20.0;
+            //    }
+            //}
+
+            // Read input
+            if (self.hovered_scroll_hash == node.hash) {
+                scroll_offset -= self.input.scroll_y * 20.0;
             }
 
             // CLAMP IMMEDIATELY! (Using last frame's content height)
@@ -2092,6 +2314,21 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
 
     ui.label("Performance Graph:");
     ui.graph("my_chart", &my_graph_data, 0.0, 100.0, 500.0, 150.0);
+
+    // Open a floating window at X: 400, Y: 100
+    ui.beginWindow("Inspector", 400.0, 100.0, 700.0, 400.0);
+
+    ui.label("[b]Floating Tool Palette[/]");
+
+    if (ui.buttonFullWidth("Reset Settings", .{})) {
+        master_volume = 0.5;
+        graphics_quality = 1;
+        counter = 0;
+    }
+
+    _ = ui.slider("Volume Override", &master_volume, 0.0, 1.0);
+
+    ui.endWindow();
 
     ui.popBox();
 
