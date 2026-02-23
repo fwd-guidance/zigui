@@ -739,13 +739,43 @@ pub const UI = struct {
         var text_width: f32 = 0.0;
         if (node.text.len > 0) {
             var dummy_y: f32 = 0.0;
-            for (node.text) |char| {
+            var j: usize = 0;
+            while (j < node.text.len) {
+                // Check for markup tags and SKIP them!
+                if (node.text[j] == '[' and j + 1 < node.text.len) {
+                    if (std.mem.startsWith(u8, node.text[j..], "[/]")) {
+                        j += 3;
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, node.text[j..], "[b]")) {
+                        j += 3;
+                        continue;
+                    }
+                    if (node.text.len >= j + 9 and node.text[j + 1] == '#' and node.text[j + 8] == ']') {
+                        j += 9;
+                        continue;
+                    }
+                }
+
+                const char = node.text[j];
                 if (char >= 32 and char < 128) {
                     var q: c.stbtt_aligned_quad = undefined;
                     c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
                 }
+                j += 1;
             }
         }
+
+        //var text_width: f32 = 0.0;
+        //if (node.text.len > 0) {
+        //    var dummy_y: f32 = 0.0;
+        //    for (node.text) |char| {
+        //        if (char >= 32 and char < 128) {
+        //            var q: c.stbtt_aligned_quad = undefined;
+        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
+        //        }
+        //    }
+        //}
 
         // 2. Establish our baseline coordinates
         var start_x: f32 = node.rect.pos[0];
@@ -760,23 +790,56 @@ pub const UI = struct {
         var cursor_y = start_y;
         var edit_cursor_x: f32 = start_x; // This will track where our blinking line goes
 
-        // 3. Draw characters and track the exact X-coordinate of the edit cursor
+        // --- 2. MARKUP RENDERING & FAUX BOLD ---
         if (node.text.len > 0) {
-            for (node.text, 0..) |char, i| {
-                // If we hit the current cursor index, save the exact pixel X-coordinate!
+            var current_color = [4]f32{ 1.0, 1.0, 1.0, 1.0 }; // Default White
+            var is_bold = false;
+            var i: usize = 0;
+
+            while (i < node.text.len) {
+                // Parse Tags
+                if (node.text[i] == '[' and i + 1 < node.text.len) {
+                    // Reset Tag
+                    if (std.mem.startsWith(u8, node.text[i..], "[/]")) {
+                        current_color = .{ 1.0, 1.0, 1.0, 1.0 };
+                        is_bold = false;
+                        i += 3;
+                        continue;
+                    }
+                    // Bold Tag
+                    if (std.mem.startsWith(u8, node.text[i..], "[b]")) {
+                        is_bold = true;
+                        i += 3;
+                        continue;
+                    }
+                    // Hex Color Tag (e.g., [#FF0000])
+                    if (node.text.len >= i + 9 and node.text[i + 1] == '#' and node.text[i + 8] == ']') {
+                        const hex = node.text[i + 2 .. i + 8];
+                        if (std.fmt.parseInt(u32, hex, 16)) |val| {
+                            current_color[0] = @as(f32, @floatFromInt((val >> 16) & 0xFF)) / 255.0;
+                            current_color[1] = @as(f32, @floatFromInt((val >> 8) & 0xFF)) / 255.0;
+                            current_color[2] = @as(f32, @floatFromInt(val & 0xFF)) / 255.0;
+                            i += 9;
+                            continue;
+                        } else |_| {} // Ignore invalid hex
+                    }
+                }
+
+                // If we reach the cursor index, save the X coordinate!
                 if (node.is_focused and node.text_cursor_index == i) {
                     edit_cursor_x = cursor_x;
                 }
 
+                const char = node.text[i];
                 if (char >= 32 and char < 128) {
                     var q: c.stbtt_aligned_quad = undefined;
-                    // Note: This modifies cursor_x and cursor_y!
                     c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
 
+                    // 1. Draw Normal Character
                     instances.append(self.allocator, InstanceData{
                         .rect_pos = .{ q.x0, q.y0 },
                         .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
-                        .color = .{ 1.0, 1.0, 1.0, 1.0 },
+                        .color = current_color, // Apply dynamic color!
                         .clip_rect = node.clip_rect,
                         .corner_radius = 0.0,
                         .edge_softness = 0.0,
@@ -784,10 +847,54 @@ pub const UI = struct {
                         .uv_min = .{ q.s0, q.t0 },
                         .uv_max = .{ q.s1, q.t1 },
                     }) catch unreachable;
-                    //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
+
+                    // 2. Faux Bold (Draw a second time, shifted right by 1 pixel)
+                    if (is_bold) {
+                        instances.append(self.allocator, InstanceData{
+                            .rect_pos = .{ q.x0 + 1.0, q.y0 }, // +1.0 X offset!
+                            .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
+                            .color = current_color,
+                            .clip_rect = node.clip_rect,
+                            .corner_radius = 0.0,
+                            .edge_softness = 0.0,
+                            .type_flag = 1,
+                            .uv_min = .{ q.s0, q.t0 },
+                            .uv_max = .{ q.s1, q.t1 },
+                        }) catch unreachable;
+                    }
                 }
+                i += 1;
             }
         }
+
+        // 3. Draw characters and track the exact X-coordinate of the edit cursor
+        //if (node.text.len > 0) {
+        //    for (node.text, 0..) |char, i| {
+        //        // If we hit the current cursor index, save the exact pixel X-coordinate!
+        //        if (node.is_focused and node.text_cursor_index == i) {
+        //            edit_cursor_x = cursor_x;
+        //        }
+
+        //        if (char >= 32 and char < 128) {
+        //            var q: c.stbtt_aligned_quad = undefined;
+        //            // Note: This modifies cursor_x and cursor_y!
+        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
+
+        //            instances.append(self.allocator, InstanceData{
+        //                .rect_pos = .{ q.x0, q.y0 },
+        //                .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
+        //                .color = .{ 1.0, 1.0, 1.0, 1.0 },
+        //                .clip_rect = node.clip_rect,
+        //                .corner_radius = 0.0,
+        //                .edge_softness = 0.0,
+        //                .type_flag = 1,
+        //                .uv_min = .{ q.s0, q.t0 },
+        //                .uv_max = .{ q.s1, q.t1 },
+        //            }) catch unreachable;
+        //            //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
+        //        }
+        //    }
+        //}
 
         // If the cursor index is at the very end of the string (or the string is empty)
         if (node.is_focused and node.text_cursor_index == node.text.len) {
@@ -1955,6 +2062,8 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
 
     main_panel.padding = 20.0;
     main_panel.gap = 10.0;
+
+    ui.label("This GUI supports [#FF0000]Colors[/], [#55FF55]Multiple [#5555FF]Tags[/], and [b]Faux Bold Text[/] inline!");
 
     var counter_buf: [32]u8 = undefined;
     const counter_text = std.fmt.bufPrint(&counter_buf, "Counter: {d}", .{counter}) catch "Counter: Error";
