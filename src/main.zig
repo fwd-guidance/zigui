@@ -6,6 +6,7 @@ const c = @cImport({
     @cInclude("RGFW.h");
     @cInclude("webgpu/webgpu.h");
     @cInclude("stb_truetype.h");
+    @cInclude("stb_image.h");
 });
 
 // ==========================================
@@ -21,6 +22,8 @@ var my_text_buf: [256]u8 = undefined;
 var my_text_len: usize = 0;
 var my_dropdown_index: usize = 0;
 const dropdown_options = [_][]const u8{ "Low", "Medium", "High", "Ultra" };
+var my_image: Texture = undefined;
+var image_loaded: bool = false;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -78,6 +81,7 @@ pub const Box = struct {
     text_cursor_index: usize = 0,
     fixed_x: f32 = 0.0,
     fixed_y: f32 = 0.0,
+    texture: ?Texture = null,
 };
 
 pub const BoxState = struct {
@@ -104,6 +108,19 @@ pub const InstanceData = extern struct {
 
     uv_min: [2]f32,
     uv_max: [2]f32,
+};
+
+pub const DrawCmd = struct {
+    bind_group: c.WGPUBindGroup,
+    instance_offset: u32,
+    instance_count: u32,
+};
+
+pub const Texture = struct {
+    wgpu_tex: c.WGPUTexture,
+    bind_group: c.WGPUBindGroup,
+    width: u32,
+    height: u32,
 };
 
 pub const InputState = struct {
@@ -327,15 +344,28 @@ pub const UI = struct {
             var instances = std.ArrayList(InstanceData){};
             defer instances.deinit(self.allocator);
 
-            self.buildRenderCommands(root, &instances, &app.font);
+            var draw_cmds = std.ArrayList(DrawCmd){};
+            defer draw_cmds.deinit(self.allocator);
+
+            var current_bg = app.font.bind_group;
+            draw_cmds.append(self.allocator, .{
+                .bind_group = current_bg,
+                .instance_offset = 0,
+                .instance_count = 0,
+            }) catch unreachable;
+
+            self.buildRenderCommands(root, &instances, &draw_cmds, &current_bg, &app.font);
 
             // 2. NEW: Render popups perfectly over the top of everything else!
             for (self.deferred_popups.items) |popup| {
                 popup.flags.is_popup = false; // Temporarily disable flag so it passes the check
-                self.buildRenderCommands(popup, &instances, &app.font);
+                self.buildRenderCommands(popup, &instances, &draw_cmds, &current_bg, &app.font);
                 popup.flags.is_popup = true; // Restore it
             }
-            app.renderUI(instances.items);
+
+            var final_cmd = &draw_cmds.items[draw_cmds.items.len - 1];
+            final_cmd.instance_count = @intCast(instances.items.len - final_cmd.instance_offset);
+            app.renderUI(instances.items, draw_cmds.items);
         }
     }
 
@@ -511,7 +541,24 @@ pub const UI = struct {
         }
     }
 
-    fn buildRenderCommands(self: *UI, node: *Box, instances: *std.ArrayList(InstanceData), font: *Font) void {
+    fn buildRenderCommands(self: *UI, node: *Box, instances: *std.ArrayList(InstanceData), draw_cmds: *std.ArrayList(DrawCmd), current_bg: *c.WGPUBindGroup, font: *Font) void {
+        const target_bg = if (node.texture) |tex| tex.bind_group else font.bind_group;
+
+        if (current_bg.* != target_bg) {
+            // 1. Lock in the exact count for the PREVIOUS batch
+            var last_cmd = &draw_cmds.items[draw_cmds.items.len - 1];
+            last_cmd.instance_count = @intCast(instances.items.len - last_cmd.instance_offset);
+
+            // 2. Start the NEW batch
+            draw_cmds.append(self.allocator, DrawCmd{
+                .bind_group = target_bg,
+                .instance_offset = @intCast(instances.items.len),
+                .instance_count = 0,
+            }) catch unreachable;
+
+            current_bg.* = target_bg;
+        }
+
         // --- DEFER POPUPS TO THE END ---
         if (node.flags.is_popup) {
             self.deferred_popups.append(self.allocator, node) catch {};
@@ -523,6 +570,21 @@ pub const UI = struct {
             state.last_frame_rect = node.rect;
             state.last_frame_clip = node.clip_rect;
             state.last_frame_z_index = node.z_index;
+        }
+
+        // --- TEXTURE BATCH BREAKING ---
+        if (node.texture != null) {
+            instances.append(self.allocator, InstanceData{
+                .rect_pos = node.rect.pos,
+                .rect_size = node.rect.size,
+                .color = .{ 1.0, 1.0, 1.0, 1.0 },
+                .clip_rect = node.clip_rect,
+                .corner_radius = node.corner_radius,
+                .edge_softness = 0.0,
+                .type_flag = 2, // 2 = Image Texture!
+                .uv_min = .{ 0.0, 0.0 },
+                .uv_max = .{ 1.0, 1.0 },
+            }) catch unreachable;
         }
 
         if (node.flags.draw_background) {
@@ -537,6 +599,7 @@ pub const UI = struct {
                 .uv_min = .{ 0.0, 0.0 },
                 .uv_max = .{ 0.0, 0.0 },
             }) catch unreachable;
+            //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
         }
 
         var text_width: f32 = 0.0;
@@ -587,6 +650,7 @@ pub const UI = struct {
                         .uv_min = .{ q.s0, q.t0 },
                         .uv_max = .{ q.s1, q.t1 },
                     }) catch unreachable;
+                    //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
                 }
             }
         }
@@ -614,12 +678,13 @@ pub const UI = struct {
                     .uv_min = .{ 0.0, 0.0 },
                     .uv_max = .{ 0.0, 0.0 },
                 }) catch unreachable;
+                //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
             }
         }
 
         var iter = node.first;
         while (iter) |child| : (iter = child.next) {
-            self.buildRenderCommands(child, instances, font);
+            self.buildRenderCommands(child, instances, draw_cmds, current_bg, font);
         }
     }
 
@@ -992,6 +1057,19 @@ pub const UI = struct {
 
         return changed;
     }
+
+    pub fn image(self: *UI, tex: Texture, width: f32, height: f32) void {
+        var box = self.pushBox("image", BoxFlags{});
+        box.pref_size = .{ .{ .kind = .pixels, .value = width }, .{ .kind = .pixels, .value = height } };
+
+        // --- CUSTOM RENDER CALLBACK ---
+        // Instead of writing the rendering logic inside buildRenderCommands,
+        // we can store the texture pointer directly on the box!
+        // (You will need to add `texture: ?Texture = null` to your Box struct!)
+        box.texture = tex;
+
+        self.popBox();
+    }
 };
 
 // ==========================================
@@ -1023,8 +1101,8 @@ const wgsl_shader =
     \\     @location(7) tex_uv: vec2<f32>,
     \\ };
     \\
-    \\ @group(0) @binding(0) var font_tex: texture_2d<f32>;
-    \\ @group(0) @binding(1) var font_sampler: sampler;
+    \\ @group(0) @binding(0) var diffuse_tex: texture_2d<f32>;
+    \\ @group(0) @binding(1) var diffuse_sampler: sampler;
     \\ @group(0) @binding(2) var<uniform> screen_size: vec2<f32>;
     \\
     \\ @vertex fn vs_main(model: VertexInput, instance: InstanceInput) -> VertexOutput {
@@ -1057,9 +1135,13 @@ const wgsl_shader =
     \\     if (pixel_x < in.clip_rect[0] || pixel_y < in.clip_rect[1] || 
     \\         pixel_x > in.clip_rect[2] || pixel_y > in.clip_rect[3]) { discard; }
     \\     if (in.type_flag == 1u) {
-    \\         let alpha = textureSample(font_tex, font_sampler, in.tex_uv).r;
+    \\         let alpha = textureSample(diffuse_tex, diffuse_sampler, in.tex_uv).r;
     \\         if (alpha <= 0.01) { discard; }
     \\         return vec4<f32>(in.color.rgb, in.color.a * alpha);
+    \\     } else if (in.type_flag == 2u) {
+    \\         let tex_color = textureSample(diffuse_tex, diffuse_sampler, in.tex_uv);
+    \\         if (tex_color.a <= 0.01) { discard; }
+    \\         return tex_color;
     \\     } else {
     \\         let half_size = in.box_size * 0.5;
     \\         let pixel_pos = (in.uv * in.box_size) - half_size; 
@@ -1087,6 +1169,8 @@ const AppState = struct {
     ibo: c.WGPUBuffer,
     font: Font,
     screen_uniform_buf: c.WGPUBuffer,
+
+    bind_group_layout: c.WGPUBindGroupLayout,
 
     const Self = @This();
 
@@ -1212,7 +1296,6 @@ const AppState = struct {
             .entries = &bgl_entries,
         };
         const bind_group_layout = c.wgpuDeviceCreateBindGroupLayout(device, &bgl_desc);
-        defer c.wgpuBindGroupLayoutRelease(bind_group_layout);
 
         // --- 5. Create the Actual Bind Group (The Data) ---
         var bg_entries = [_]c.WGPUBindGroupEntry{
@@ -1410,6 +1493,7 @@ const AppState = struct {
             .ibo = ibo,
             .font = font,
             .screen_uniform_buf = screen_uniform_buf,
+            .bind_group_layout = bind_group_layout,
         };
     }
 
@@ -1424,6 +1508,7 @@ const AppState = struct {
         c.wgpuAdapterRelease(self.adapter);
         c.wgpuSurfaceRelease(self.surface);
         c.wgpuInstanceRelease(self.instance);
+        c.wgpuBindGroupLayoutRelease(self.bind_group_layout);
         c.RGFW_window_close(self.window);
     }
 
@@ -1447,7 +1532,7 @@ const AppState = struct {
         c.wgpuQueueWriteBuffer(self.queue, self.screen_uniform_buf, 0, &new_size, @sizeOf([2]f32));
     }
 
-    pub fn renderUI(self: *Self, instances: []const InstanceData) void {
+    pub fn renderUI(self: *Self, instances: []const InstanceData, draw_cmds: []const DrawCmd) void {
         var surface_texture: c.WGPUSurfaceTexture = undefined;
         c.wgpuSurfaceGetCurrentTexture(self.surface, &surface_texture);
         if (surface_texture.texture == null) return;
@@ -1491,9 +1576,16 @@ const AppState = struct {
         c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.vbo, 0, c.WGPU_WHOLE_SIZE);
         c.wgpuRenderPassEncoderSetVertexBuffer(pass, 1, self.ibo, 0, c.WGPU_WHOLE_SIZE);
 
-        // Draw 6 vertices (2 triangles for the unit quad) N times
-        if (instances.len > 0) {
-            c.wgpuRenderPassEncoderDraw(pass, 6, @intCast(instances.len), 0, 0);
+        // --- THE SAFE BATCH EXECUTION ---
+        for (draw_cmds) |cmd| {
+            if (cmd.instance_count > 0) {
+                // Swap the texture bind group
+                c.wgpuRenderPassEncoderSetBindGroup(pass, 0, cmd.bind_group, 0, null);
+
+                // Use WebGPU's native firstInstance parameter!
+                // (Draw 6 vertices, `cmd.instance_count` times, starting at instance `cmd.instance_offset`)
+                c.wgpuRenderPassEncoderDraw(pass, 6, cmd.instance_count, 0, cmd.instance_offset);
+            }
         }
 
         c.wgpuRenderPassEncoderEnd(pass);
@@ -1502,6 +1594,103 @@ const AppState = struct {
         const cmd_buf = c.wgpuCommandEncoderFinish(encoder, null);
         c.wgpuQueueSubmit(self.queue, 1, &cmd_buf);
         _ = c.wgpuSurfacePresent(self.surface);
+    }
+
+    pub fn loadTexture(self: *Self, file_path: [*c]const u8) !Texture {
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var channels: c_int = 0;
+
+        // 1. Load image via stb_image (Force 4 channels for RGBA)
+        const image_data = c.stbi_load(file_path, &width, &height, &channels, 4);
+        if (image_data == null) return error.ImageLoadFailed;
+        defer c.stbi_image_free(image_data);
+
+        // 2. Create WGPU Texture
+        const tex_desc = c.WGPUTextureDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+
+            .usage = c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = @intCast(width), .height = @intCast(height), .depthOrArrayLayers = 1 },
+            .format = c.WGPUTextureFormat_RGBA8Unorm, // Full color!
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+            .viewFormatCount = 0,
+            .viewFormats = null,
+        };
+        const wgpu_tex = c.wgpuDeviceCreateTexture(self.device, &tex_desc);
+
+        // 3. Upload pixels to GPU
+        const image_copy = c.WGPUTexelCopyTextureInfo{
+            .texture = wgpu_tex,
+            .mipLevel = 0,
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .aspect = c.WGPUTextureAspect_All,
+        };
+        const layout = c.WGPUTexelCopyBufferLayout{
+            .offset = 0,
+            .bytesPerRow = @as(u32, @intCast(width)) * 4,
+            .rowsPerImage = @intCast(height),
+        };
+        const copy_size = c.WGPUExtent3D{ .width = @intCast(width), .height = @intCast(height), .depthOrArrayLayers = 1 };
+        c.wgpuQueueWriteTexture(self.queue, &image_copy, image_data, @as(usize, @intCast(width * height * 4)), &layout, &copy_size);
+
+        // 4. Create View & Sampler
+        const tex_view = c.wgpuTextureCreateView(wgpu_tex, null);
+        defer c.wgpuTextureViewRelease(tex_view);
+
+        const sampler_desc = c.WGPUSamplerDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .addressModeU = c.WGPUAddressMode_ClampToEdge,
+            .addressModeV = c.WGPUAddressMode_ClampToEdge,
+            .addressModeW = c.WGPUAddressMode_ClampToEdge,
+            .magFilter = c.WGPUFilterMode_Linear,
+            .minFilter = c.WGPUFilterMode_Linear,
+            .mipmapFilter = c.WGPUMipmapFilterMode_Linear,
+            .lodMinClamp = 0.0,
+            .lodMaxClamp = 32.0,
+            .compare = c.WGPUCompareFunction_Undefined,
+            .maxAnisotropy = 1,
+        };
+        const sampler = c.wgpuDeviceCreateSampler(self.device, &sampler_desc);
+        defer c.wgpuSamplerRelease(sampler);
+
+        // 5. Create Bind Group
+        var bg_entries = [_]c.WGPUBindGroupEntry{
+            std.mem.zeroes(c.WGPUBindGroupEntry),
+            std.mem.zeroes(c.WGPUBindGroupEntry),
+            std.mem.zeroes(c.WGPUBindGroupEntry),
+        };
+
+        bg_entries[0].binding = 0;
+        bg_entries[0].textureView = tex_view;
+
+        bg_entries[1].binding = 1;
+        bg_entries[1].sampler = sampler;
+
+        bg_entries[2].binding = 2;
+        bg_entries[2].buffer = self.screen_uniform_buf;
+        bg_entries[2].offset = 0;
+        bg_entries[2].size = @sizeOf([2]f32);
+
+        const bg_desc = c.WGPUBindGroupDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .layout = self.bind_group_layout, // Uses the layout we just saved!
+            .entryCount = bg_entries.len,
+            .entries = &bg_entries,
+        };
+        const bind_group = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc);
+
+        return Texture{
+            .wgpu_tex = wgpu_tex,
+            .bind_group = bind_group,
+            .width = @intCast(width),
+            .height = @intCast(height),
+        };
     }
 };
 
@@ -1601,8 +1790,12 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
 
     _ = (ui.dropdown("Graphics Quality", &dropdown_options, &my_dropdown_index));
 
-    ui.label("Date:");
-    _ = (ui.textInput("date_input", &my_text_buf, &my_text_len));
+    if (image_loaded) {
+        // Draw the image at its native resolution!
+        ui.image(my_image, @floatFromInt(my_image.width), @floatFromInt(my_image.height));
+    } else {
+        ui.label("(Image failed to load)");
+    }
 
     ui.popBox();
 
@@ -1615,6 +1808,13 @@ pub fn main() !void {
 
     var app = try AppState.init();
     defer app.deinit();
+
+    if (app.loadTexture("test.png")) |tex| {
+        my_image = tex;
+        image_loaded = true;
+    } else |err| {
+        std.debug.print("Failed to load test.png! Error: {}\n", .{err});
+    }
 
     var window_width: u32 = 800;
     var window_height: u32 = 600;
