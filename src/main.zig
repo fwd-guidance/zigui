@@ -766,17 +766,6 @@ pub const UI = struct {
             }
         }
 
-        //var text_width: f32 = 0.0;
-        //if (node.text.len > 0) {
-        //    var dummy_y: f32 = 0.0;
-        //    for (node.text) |char| {
-        //        if (char >= 32 and char < 128) {
-        //            var q: c.stbtt_aligned_quad = undefined;
-        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
-        //        }
-        //    }
-        //}
-
         // 2. Establish our baseline coordinates
         var start_x: f32 = node.rect.pos[0];
         switch (node.text_align) {
@@ -866,35 +855,6 @@ pub const UI = struct {
                 i += 1;
             }
         }
-
-        // 3. Draw characters and track the exact X-coordinate of the edit cursor
-        //if (node.text.len > 0) {
-        //    for (node.text, 0..) |char, i| {
-        //        // If we hit the current cursor index, save the exact pixel X-coordinate!
-        //        if (node.is_focused and node.text_cursor_index == i) {
-        //            edit_cursor_x = cursor_x;
-        //        }
-
-        //        if (char >= 32 and char < 128) {
-        //            var q: c.stbtt_aligned_quad = undefined;
-        //            // Note: This modifies cursor_x and cursor_y!
-        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
-
-        //            instances.append(self.allocator, InstanceData{
-        //                .rect_pos = .{ q.x0, q.y0 },
-        //                .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
-        //                .color = .{ 1.0, 1.0, 1.0, 1.0 },
-        //                .clip_rect = node.clip_rect,
-        //                .corner_radius = 0.0,
-        //                .edge_softness = 0.0,
-        //                .type_flag = 1,
-        //                .uv_min = .{ q.s0, q.t0 },
-        //                .uv_max = .{ q.s1, q.t1 },
-        //            }) catch unreachable;
-        //            //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
-        //        }
-        //    }
-        //}
 
         // If the cursor index is at the very end of the string (or the string is empty)
         if (node.is_focused and node.text_cursor_index == node.text.len) {
