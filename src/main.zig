@@ -1206,7 +1206,7 @@ pub const UI = struct {
     }
 
     pub fn graph(self: *UI, id_str: []const u8, data: []const f32, min_val: f32, max_val: f32, width: f32, height: f32) void {
-        var box = self.pushBox(id_str, BoxFlags{ .draw_background = true });
+        var box = self.pushBox(id_str, BoxFlags{ .draw_background = true, .clickable = true });
 
         // Give the graph an explicit height, let it fill available width
         box.pref_size = .{ .{ .kind = .pixels, .value = width }, .{ .kind = .pixels, .value = height } };
@@ -1217,6 +1217,55 @@ pub const UI = struct {
         box.graph_data = data;
         box.graph_min = min_val;
         box.graph_max = max_val;
+
+        // --- 2. INTERACTIVITY & TOOLTIPS ---
+        if (self.hot_hash_this_frame == box.hash and data.len > 1) {
+            // Read the screen coordinates of the graph from the layout cache
+            if (self.layout_cache.get(box.hash)) |rect| {
+
+                // Math: Find which data index the mouse is currently hovering over
+                const local_x = self.input.mouse_x - rect[0];
+                const hover_pct = @max(0.0, @min(1.0, local_x / rect[2]));
+
+                const float_idx = hover_pct * @as(f32, @floatFromInt(data.len - 1));
+                const nearest_index = @as(usize, @intFromFloat(@round(float_idx))); // Snap to nearest point
+
+                // Math: Calculate the exact screen X coordinate of that data point
+                const point_x = rect[0] + (@as(f32, @floatFromInt(nearest_index)) / @as(f32, @floatFromInt(data.len - 1)) * rect[2]);
+
+                // A. Draw a Vertical Scrubber Line
+                var scrubber = self.pushBox("scrubber", BoxFlags{
+                    .is_popup = true,
+                    .floating = true, // Force absolute coordinates
+                    .draw_background = true,
+                });
+                scrubber.fixed_x = point_x;
+                scrubber.fixed_y = rect[1];
+                scrubber.pref_size = .{ .{ .kind = .pixels, .value = 2.0 }, .{ .kind = .pixels, .value = rect[3] } };
+                scrubber.bg_color = .{ 1.0, 1.0, 1.0, 0.2 }; // Semi-transparent white line
+                scrubber.z_index = 15;
+                self.popBox();
+
+                // B. Draw the Floating Tooltip
+                const val = data[nearest_index];
+                const tip_text = std.fmt.allocPrint(self.frame_arena.allocator(), "Index {d}: {d:.2}", .{ nearest_index, val }) catch "Error";
+
+                var tip = self.pushBox("tooltip", BoxFlags{ .is_popup = true, .floating = true, .draw_background = true });
+                tip.text = tip_text;
+
+                // Position it offset slightly from the mouse cursor so it doesn't block the line!
+                tip.fixed_x = self.input.mouse_x + 15.0;
+                tip.fixed_y = self.input.mouse_y - 15.0;
+
+                tip.pref_size = .{ .{ .kind = .text_content, .value = 0.0 }, .{ .kind = .pixels, .value = 24.0 } };
+                tip.bg_color = .{ 0.2, 0.2, 0.2, 0.95 }; // Dark grey, mostly opaque
+                tip.padding = 6.0;
+                tip.corner_radius = 4.0;
+                tip.z_index = 20; // Ensure it renders on top of everything
+
+                self.popBox(); // pop tip
+            }
+        }
 
         self.popBox();
     }
