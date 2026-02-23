@@ -95,6 +95,8 @@ pub const BoxState = struct {
     // Animation states
     hot_t: f32 = 0.0,
     active_t: f32 = 0.0,
+
+    drag_offset_y: f32 = 0.0,
 };
 
 pub const InstanceData = extern struct {
@@ -325,6 +327,75 @@ pub const UI = struct {
     }
 
     pub fn popBox(self: *UI) void {
+        const node = self.parent_stack[self.parent_stack_top - 1];
+
+        // --- INJECT VISUAL SCROLLBAR ---
+        if (node.flags.scrollable_y) {
+            if (self.layout_cache.get(node.hash)) |rect| {
+                if (self.scroll_state.get(node.hash)) |state| {
+                    var scroll_offset = state[0];
+                    const content_height = state[1];
+                    const visible_height = rect[3];
+
+                    // If content overflows the container, we draw a scrollbar!
+                    if (content_height > visible_height and visible_height > 0.0) {
+                        var thumb = self.pushBox("_scrollbar_thumb_", BoxFlags{
+                            .is_popup = true,
+                            .floating = true, // Force absolute coordinates
+                            .clickable = true,
+                            .draw_background = true,
+                        });
+
+                        // 1. Calculate Thumb Size
+                        const thumb_w: f32 = 8.0;
+                        const min_thumb_h: f32 = 20.0;
+                        const thumb_h = @max(min_thumb_h, visible_height * (visible_height / content_height));
+
+                        // 2. Calculate Thumb Position
+                        const max_scroll = content_height - visible_height;
+                        const scroll_pct = scroll_offset / max_scroll;
+                        const track_h = @max(0.0, visible_height - thumb_h);
+
+                        thumb.fixed_x = rect[0] + rect[2] - thumb_w - 4.0;
+                        thumb.fixed_y = rect[1] + (scroll_pct * track_h);
+
+                        thumb.pref_size = .{ .{ .kind = .pixels, .value = thumb_w }, .{ .kind = .pixels, .value = thumb_h } };
+                        thumb.corner_radius = 4.0;
+                        thumb.z_index = 5; // Float over the content
+
+                        // 3. Handle Drag Interaction
+                        if (self.active_hash == thumb.hash) {
+                            thumb.bg_color = .{ 0.4, 0.4, 0.4, 1.0 };
+
+                            if (self.retained_state.getPtr(thumb.hash)) |thumb_state| {
+                                // Cache exact pixel offset on initial click!
+                                if (self.input.mouse_left_pressed) {
+                                    thumb_state.drag_offset_y = self.input.mouse_y - thumb.fixed_y;
+                                }
+
+                                // Drag Math
+                                const target_y = self.input.mouse_y - thumb_state.drag_offset_y;
+                                const mouse_local_y = target_y - rect[1];
+
+                                var new_pct: f32 = 0.0;
+                                if (track_h > 0.0) new_pct = mouse_local_y / track_h;
+                                new_pct = @max(0.0, @min(1.0, new_pct)); // Clamp to bounds
+
+                                scroll_offset = new_pct * max_scroll;
+                                // Save state immediately so layout phase sees it!
+                                self.scroll_state.put(node.hash, .{ scroll_offset, content_height }) catch {};
+                            }
+                        } else if (self.hot_hash_this_frame == thumb.hash) {
+                            thumb.bg_color = .{ 0.5, 0.5, 0.5, 0.8 }; // Hover
+                        } else {
+                            thumb.bg_color = .{ 0.3, 0.3, 0.3, 0.5 }; // Idle
+                        }
+
+                        self.popBox(); // Close the thumb
+                    }
+                }
+            }
+        }
         self.parent_stack_top -= 1;
     }
 
@@ -466,8 +537,13 @@ pub const UI = struct {
         var child_it = node.first;
         while (child_it) |child| : (child_it = child.next) {
             if (child.flags.is_popup) {
-                // Force absolute coordinates instead of cursor coordinates
-                child.rect.pos = .{ cursor_x, cursor_y };
+                if (child.flags.floating) {
+                    // Scrollbars: Pin to absolute screen coordinates!
+                    child.rect.pos = .{ child.fixed_x, child.fixed_y };
+                } else {
+                    // Dropdowns: Drop inline with the layout cursor
+                    child.rect.pos = .{ cursor_x, cursor_y };
+                }
 
                 // Copy literal pixel sizes over immediately
                 if (child.pref_size[0].kind == .pixels) child.calculated_size[0] = child.pref_size[0].value;
@@ -478,10 +554,12 @@ pub const UI = struct {
                 // Recursively calculate the popup's children, then SKIP the flex math!
                 self.computeLayout(child);
 
-                // catch the absolute bottom edge of the popup
-                const bottom_edge = child.rect.pos[1] + child.rect.size[1];
-                if (bottom_edge > max_child_y) {
-                    max_child_y = bottom_edge;
+                // Only let inline dropdowns expand the scroll boundaries!
+                if (!child.flags.floating) {
+                    const bottom_edge = child.rect.pos[1] + child.rect.size[1];
+                    if (bottom_edge > max_child_y) {
+                        max_child_y = bottom_edge;
+                    }
                 }
                 continue;
             }
