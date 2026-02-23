@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const c = @cImport({
     @cDefine("RGFW_WEBGPU", {});
@@ -16,6 +17,8 @@ var vsync_enabled: bool = true;
 var show_debug: bool = false;
 var graphics_quality: usize = 1; // 0=Low, 1=Medium, 2=High
 var master_volume: f32 = 0.5;
+var my_text_buf: [256]u8 = undefined;
+var my_text_len: usize = 0;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -68,6 +71,8 @@ pub const Box = struct {
     calculated_size: [2]f32 = .{ 0.0, 0.0 },
     padding: f32 = 0.0,
     gap: f32 = 0.0,
+    is_focused: bool = false,
+    text_cursor_index: usize = 0,
 };
 
 pub const BoxState = struct {
@@ -104,6 +109,13 @@ pub const InputState = struct {
     mouse_left_released: bool = false,
 
     scroll_y: f32 = 0.0,
+
+    typed_char: u8 = 0,
+    backspace_pressed: bool = false,
+    shift_pressed: bool = false,
+    caps_lock_active: bool = false,
+    left_arrow_pressed: bool = false,
+    right_arrow_pressed: bool = false,
 };
 
 pub const Font = struct {
@@ -147,6 +159,9 @@ pub const UI = struct {
 
     layout_cache: std.AutoHashMap(u64, [4]f32),
     scroll_state: std.AutoHashMap(u64, [2]f32),
+
+    focused_hash: u64 = 0,
+    focused_cursor_index: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) !UI {
         return UI{
@@ -470,41 +485,47 @@ pub const UI = struct {
             }) catch unreachable;
         }
 
-        // Draw Text
+        var text_width: f32 = 0.0;
         if (node.text.len > 0) {
-            // 1. Measure the exact pixel width of the string
-            var text_width: f32 = 0.0;
             var dummy_y: f32 = 0.0;
             for (node.text) |char| {
                 if (char >= 32 and char < 128) {
                     var q: c.stbtt_aligned_quad = undefined;
-                    // We just use this to advance the text_width variable
                     c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
                 }
             }
+        }
 
-            // 2. Calculate the starting X position based on alignment
-            var cursor_x: f32 = node.rect.pos[0];
-            switch (node.text_align) {
-                .center => cursor_x += (node.rect.size[0] - text_width) / 2.0,
-                .right => cursor_x += (node.rect.size[0] - text_width) - node.padding,
-                .left => cursor_x += node.padding, // Add a little padding so it doesn't touch the left wall
-            }
+        // 2. Establish our baseline coordinates
+        var start_x: f32 = node.rect.pos[0];
+        switch (node.text_align) {
+            .center => start_x += (node.rect.size[0] - text_width) / 2.0,
+            .right => start_x += (node.rect.size[0] - text_width) - node.padding,
+            .left => start_x += node.padding,
+        }
+        const start_y = node.rect.pos[1] + (node.rect.size[1] / 2.0) + 8.0;
 
-            // 3. Center the text vertically
-            // (Assuming a ~32px font, the baseline is usually offset down by about a quarter of the line height)
-            var cursor_y = node.rect.pos[1] + (node.rect.size[1] / 2.0) + 8.0;
+        var cursor_x = start_x;
+        var cursor_y = start_y;
+        var edit_cursor_x: f32 = start_x; // This will track where our blinking line goes
 
-            // 4. Actually draw the quads
-            for (node.text) |char| {
+        // 3. Draw characters and track the exact X-coordinate of the edit cursor
+        if (node.text.len > 0) {
+            for (node.text, 0..) |char, i| {
+                // If we hit the current cursor index, save the exact pixel X-coordinate!
+                if (node.is_focused and node.text_cursor_index == i) {
+                    edit_cursor_x = cursor_x;
+                }
+
                 if (char >= 32 and char < 128) {
                     var q: c.stbtt_aligned_quad = undefined;
+                    // Note: This modifies cursor_x and cursor_y!
                     c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
 
                     instances.append(self.allocator, InstanceData{
                         .rect_pos = .{ q.x0, q.y0 },
                         .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
-                        .color = .{ 1.0, 1.0, 1.0, 1.0 }, // White text
+                        .color = .{ 1.0, 1.0, 1.0, 1.0 },
                         .clip_rect = node.clip_rect,
                         .corner_radius = 0.0,
                         .edge_softness = 0.0,
@@ -515,6 +536,117 @@ pub const UI = struct {
                 }
             }
         }
+
+        // If the cursor index is at the very end of the string (or the string is empty)
+        if (node.is_focused and node.text_cursor_index == node.text.len) {
+            edit_cursor_x = cursor_x;
+        }
+
+        // 4. Draw the blinking edit line
+        if (node.is_focused) {
+            const time_ms = std.time.milliTimestamp();
+            if (@mod(time_ms, 1000) > 500) {
+                const cursor_height: f32 = 18.0;
+                const centered_y = node.rect.pos[1] + (node.rect.size[1] - cursor_height) / 2.0;
+                instances.append(self.allocator, InstanceData{
+                    // Use the stable start_y minus an offset to center it vertically
+                    .rect_pos = .{ edit_cursor_x + 1.0, centered_y },
+                    .rect_size = .{ 2.0, cursor_height },
+                    .color = .{ 1.0, 1.0, 1.0, 1.0 },
+                    .clip_rect = node.clip_rect,
+                    .corner_radius = 0.0,
+                    .edge_softness = 0.0,
+                    .type_flag = 0,
+                    .uv_min = .{ 0.0, 0.0 },
+                    .uv_max = .{ 0.0, 0.0 },
+                }) catch unreachable;
+            }
+        }
+
+        // Draw Text
+        //if (node.text.len > 0) {
+        //    // 1. Measure the exact pixel width of the string
+        //    var text_width: f32 = 0.0;
+        //    var dummy_y: f32 = 0.0;
+        //    for (node.text) |char| {
+        //        if (char >= 32 and char < 128) {
+        //            var q: c.stbtt_aligned_quad = undefined;
+        //            // We just use this to advance the text_width variable
+        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
+        //        }
+        //    }
+
+        //    // 2. Calculate the starting X position based on alignment
+        //    var cursor_x: f32 = node.rect.pos[0];
+        //    switch (node.text_align) {
+        //        .center => cursor_x += (node.rect.size[0] - text_width) / 2.0,
+        //        .right => cursor_x += (node.rect.size[0] - text_width) - node.padding,
+        //        .left => cursor_x += node.padding, // Add a little padding so it doesn't touch the left wall
+        //    }
+
+        //    // 3. Center the text vertically
+        //    // (Assuming a ~32px font, the baseline is usually offset down by about a quarter of the line height)
+        //    var actual_cursor_x: f32 = cursor_x; // Defaults to the far left side
+        //    var cursor_y = node.rect.pos[1] + (node.rect.size[1] / 2.0) + 8.0;
+
+        //    // 4. Actually draw the quads
+        //    for (node.text, 0..) |char, i| {
+        //        if (node.is_focused and node.text_cursor_index == i) {
+        //            actual_cursor_x = cursor_x;
+        //        }
+
+        //        if (char >= 32 and char < 128) {
+        //            var q: c.stbtt_aligned_quad = undefined;
+        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
+
+        //            instances.append(self.allocator, InstanceData{
+        //                .rect_pos = .{ q.x0, q.y0 },
+        //                .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
+        //                .color = .{ 1.0, 1.0, 1.0, 1.0 }, // White text
+        //                .clip_rect = node.clip_rect,
+        //                .corner_radius = 0.0,
+        //                .edge_softness = 0.0,
+        //                .type_flag = 1,
+        //                .uv_min = .{ q.s0, q.t0 },
+        //                .uv_max = .{ q.s1, q.t1 },
+        //            }) catch unreachable;
+        //        }
+        //    }
+        //    //if (node.is_focused) {
+        //    //    // Blink every 0.5 seconds (using your app's delta time or a global timer)
+        //    //    // For a quick stateless hack, we can use the std.time.milliTimestamp!
+        //    //    const time_ms = std.time.milliTimestamp();
+        //    //    if (@mod(time_ms, 1000) > 500) {
+        //    //        instances.append(self.allocator, InstanceData{
+        //    //            .rect_pos = .{ cursor_x + 2.0, cursor_y - 12.0 }, // Offset slightly right and up
+        //    //            .rect_size = .{ 2.0, 16.0 }, // 2 pixels wide, 16 pixels tall
+        //    //            .color = .{ 1.0, 1.0, 1.0, 1.0 }, // White cursor
+        //    //            .clip_rect = node.clip_rect,
+        //    //            .corner_radius = 0.0,
+        //    //            .edge_softness = 0.0,
+        //    //            .type_flag = 1, // Treat as untextured solid color
+        //    //            .uv_min = .{ 0.0, 0.0 },
+        //    //            .uv_max = .{ 0.0, 0.0 },
+        //    //        }) catch unreachable;
+        //    //    }
+        //    //}
+        //    if (node.is_focused) {
+        //        const time_ms = std.time.milliTimestamp();
+        //        if (@mod(time_ms, 1000) > 500) {
+        //            instances.append(self.allocator, InstanceData{
+        //                .rect_pos = .{ actual_cursor_x + 2.0, cursor_y - 12.0 }, // USE actual_cursor_x!
+        //                .rect_size = .{ 2.0, 16.0 },
+        //                .color = .{ 1.0, 1.0, 1.0, 1.0 },
+        //                .clip_rect = node.clip_rect,
+        //                .corner_radius = 0.0,
+        //                .edge_softness = 0.0,
+        //                .type_flag = 1,
+        //                .uv_min = .{ 0.0, 0.0 },
+        //                .uv_max = .{ 0.0, 0.0 },
+        //            }) catch unreachable;
+        //        }
+        //    }
+        //}
 
         var iter = node.first;
         while (iter) |child| : (iter = child.next) {
@@ -733,6 +865,111 @@ pub const UI = struct {
         self.popBox(); // pop track
         self.popBox(); // pop row
 
+        return changed;
+    }
+
+    pub fn textInput(self: *UI, id_str: []const u8, buffer: []u8, text_len: *usize) bool {
+        var changed = false;
+
+        var box = self.pushBox(id_str, BoxFlags{ .clickable = true, .draw_background = true });
+        box.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 36.0 } };
+        box.corner_radius = 6.0;
+        box.padding = 10.0;
+        box.text_align = .left;
+
+        // 1. Handle Focus State
+        //if (self.input.mouse_left_released) {
+        //    if (self.hot_hash_this_frame == box.hash) {
+        //        self.focused_hash = box.hash; // We clicked inside! Take focus.
+        //    } else if (self.focused_hash == box.hash) {
+        //        self.focused_hash = 0; // We clicked outside. Lose focus.
+        //    }
+        //}
+
+        //box.is_focused = (self.focused_hash == box.hash);
+
+        // 1. Handle Focus State
+        if (self.input.mouse_left_released) {
+            if (self.hot_hash_this_frame == box.hash) {
+                if (self.focused_hash != box.hash) {
+                    self.focused_hash = box.hash;
+                    self.focused_cursor_index = text_len.*; // Jump cursor to the end when clicked
+                }
+            } else if (self.focused_hash == box.hash) {
+                self.focused_hash = 0;
+            }
+        }
+
+        box.is_focused = (self.focused_hash == box.hash);
+
+        // 2. Visual Styling
+        if (box.is_focused) {
+            box.bg_color = .{ 0.15, 0.15, 0.2, 1.0 }; // Brighter background when typing
+        } else if (self.hot_hash_this_frame == box.hash) {
+            box.bg_color = .{ 0.1, 0.1, 0.15, 1.0 }; // Hover color
+        } else {
+            box.bg_color = .{ 0.05, 0.05, 0.1, 1.0 }; // Idle color
+        }
+
+        // 3. Process Keystrokes
+        //if (box.is_focused) {
+        //    if (self.input.backspace_pressed and text_len.* > 0) {
+        //        text_len.* -= 1; // Erase character
+        //        changed = true;
+        //    } else if (self.input.typed_char != 0) {
+        //        if (text_len.* < buffer.len) {
+        //            buffer[text_len.*] = self.input.typed_char; // Insert character
+        //            text_len.* += 1;
+        //            changed = true;
+        //        }
+        //    }
+        //}
+
+        //// 4. Assign the slice of the buffer we actually want to draw
+        //box.text = buffer[0..text_len.*];
+
+        //self.popBox();
+        //return changed;
+
+        // 3. Process Keystrokes & Navigation
+        if (box.is_focused) {
+            // Failsafe: keep cursor within bounds
+            if (self.focused_cursor_index > text_len.*) self.focused_cursor_index = text_len.*;
+
+            // Navigation
+            if (self.input.left_arrow_pressed and self.focused_cursor_index > 0) {
+                self.focused_cursor_index -= 1;
+            }
+            if (self.input.right_arrow_pressed and self.focused_cursor_index < text_len.*) {
+                self.focused_cursor_index += 1;
+            }
+
+            // Backspace (Delete at cursor)
+            if (self.input.backspace_pressed and self.focused_cursor_index > 0) {
+                // Shift everything to the right of the cursor ONE slot to the left
+                std.mem.copyForwards(u8, buffer[self.focused_cursor_index - 1 .. text_len.* - 1], buffer[self.focused_cursor_index..text_len.*]);
+                text_len.* -= 1;
+                self.focused_cursor_index -= 1;
+                changed = true;
+            }
+            // Insert typed character at cursor
+            else if (self.input.typed_char != 0 and text_len.* < buffer.len) {
+                // Shift everything to the right of the cursor ONE slot to the right
+                std.mem.copyBackwards(u8, buffer[self.focused_cursor_index + 1 .. text_len.* + 1], buffer[self.focused_cursor_index..text_len.*]);
+                buffer[self.focused_cursor_index] = self.input.typed_char;
+                text_len.* += 1;
+                self.focused_cursor_index += 1;
+                changed = true;
+            }
+
+            // Tell the box where the cursor is so the renderer can find it!
+            box.text_cursor_index = self.focused_cursor_index;
+        }
+
+        // 4. Assign the slice
+        box.text = buffer[0..text_len.*];
+
+        self.popBox();
         return changed;
     }
 };
@@ -1330,12 +1567,14 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     ui.label("Audio");
 
     // The Slider!
-    if (ui.slider("Master Volume", &master_volume, 0.0, 1.0)) {
-        // This block fires every frame the value is actively changing
-        // You can use this to update your audio engine in real-time
-        //std.debug.print("Volume changed to: {d:.2}\n", .{master_volume});
+    _ = ui.slider("Master Volume", &master_volume, 0.0, 1.0);
 
-    }
+    spacer = ui.pushBox("Spacer5", BoxFlags{});
+    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    ui.popBox();
+
+    ui.label("Name:");
+    _ = (ui.textInput("name_input", &my_text_buf, &my_text_len));
 
     ui.popBox();
 
@@ -1378,6 +1617,10 @@ pub fn main() !void {
         current_input.mouse_left_pressed = false;
         current_input.mouse_left_released = false;
         current_input.scroll_y = 0.0;
+        current_input.typed_char = 0;
+        current_input.backspace_pressed = false;
+        current_input.left_arrow_pressed = false;
+        current_input.right_arrow_pressed = false;
 
         // 2. Poll RGFW Events
         var event: c.RGFW_event = undefined;
@@ -1408,6 +1651,81 @@ pub fn main() !void {
                     if (event.key.value == c.RGFW_escape) {
                         //c.RGFW_window_setShouldClose(app.window, 1);
                         running = false;
+                    }
+
+                    const key = event.key.value;
+
+                    if (key == c.RGFW_shiftL or key == c.RGFW_shiftR) {
+                        current_input.shift_pressed = true;
+                    } else if (key == c.RGFW_capsLock) {
+                        if (builtin.os.tag == .macos) {
+                            current_input.caps_lock_active = true;
+                        } else {
+                            current_input.caps_lock_active = !current_input.caps_lock_active;
+                        }
+                    } else if (key == c.RGFW_backSpace) {
+                        current_input.backspace_pressed = true;
+                    } else if (key == c.RGFW_left) {
+                        current_input.left_arrow_pressed = true;
+                    } else if (key == c.RGFW_right) {
+                        current_input.right_arrow_pressed = true;
+                    }
+                    // Grab basic printable ASCII characters
+                    else if (key >= 32 and key <= 126) {
+                        var char: u8 = @intCast(key);
+
+                        const uppercase_letter = current_input.shift_pressed != current_input.caps_lock_active;
+
+                        // 1. If RGFW gives us a lowercase letter, capitalize it if Shift is held
+                        if (char >= 'a' and char <= 'z') {
+                            if (uppercase_letter) {
+                                char -= 32;
+                            }
+                        }
+                        // 2. If RGFW gives us an uppercase letter, lowercase it if Shift is NOT held
+                        else if (char >= 'A' and char <= 'Z') {
+                            if (!uppercase_letter) {
+                                char += 32;
+                            }
+                        }
+                        // 3. Handle Numbers and Symbols
+                        else if (current_input.shift_pressed) {
+                            char = switch (char) {
+                                '1' => '!',
+                                '2' => '@',
+                                '3' => '#',
+                                '4' => '$',
+                                '5' => '%',
+                                '6' => '^',
+                                '7' => '&',
+                                '8' => '*',
+                                '9' => '(',
+                                '0' => ')',
+                                '-' => '_',
+                                '=' => '+',
+                                '[' => '{',
+                                ']' => '}',
+                                '\\' => '|',
+                                ';' => ':',
+                                '\'' => '"',
+                                ',' => '<',
+                                '.' => '>',
+                                '/' => '?',
+                                '`' => '~',
+                                else => char,
+                            };
+                        }
+
+                        current_input.typed_char = char;
+                    }
+                },
+                c.RGFW_keyReleased => {
+                    if (event.key.value == c.RGFW_shiftL or event.key.value == c.RGFW_shiftR) {
+                        current_input.shift_pressed = false;
+                    } else if (event.key.value == c.RGFW_capsLock) {
+                        if (builtin.os.tag == .macos) {
+                            current_input.caps_lock_active = false;
+                        }
                     }
                 },
                 c.RGFW_mouseScroll => {
