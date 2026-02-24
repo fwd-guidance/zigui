@@ -589,41 +589,6 @@ pub const UI = struct {
         }
         self.popBox(); // Close Title Bar
 
-        // --- 4. THE RESIZE HANDLE ---
-        var resize_handle = self.pushBox("resize_handle", BoxFlags{ .is_popup = true, .floating = true, .clickable = true, .draw_background = true });
-
-        const handle_size = 15.0;
-        // Pin it to the absolute bottom-right corner of the window
-        resize_handle.fixed_x = state.window_x + state.window_width - handle_size;
-        resize_handle.fixed_y = state.window_y + state.window_height - handle_size;
-        resize_handle.pref_size = .{ .{ .kind = .pixels, .value = handle_size }, .{ .kind = .pixels, .value = handle_size } };
-        resize_handle.corner_radius = 4.0;
-        resize_handle.z_index = win.z_index + 5; // Float over the content
-
-        if (self.active_hash == resize_handle.hash) {
-            resize_handle.bg_color = .{ 0.5, 0.5, 0.5, 1.0 }; // Active color
-
-            if (self.input.mouse_left_pressed) {
-                // We can safely reuse the drag offsets for size dragging!
-                state.drag_offset_x = self.input.mouse_x - state.window_width;
-                state.drag_offset_y = self.input.mouse_y - state.window_height;
-            }
-
-            // Calculate new dimensions
-            state.window_width = self.input.mouse_x - state.drag_offset_x;
-            state.window_height = self.input.mouse_y - state.drag_offset_y;
-
-            // Clamp to a minimum window size so it doesn't collapse!
-            state.window_width = @max(50.0, state.window_width);
-            state.window_height = @max(50.0, state.window_height);
-        } else if (self.hot_hash_this_frame == resize_handle.hash) {
-            resize_handle.bg_color = .{ 0.4, 0.4, 0.4, 0.8 }; // Hover color
-        } else {
-            resize_handle.bg_color = .{ 1.0, 0.0, 0.0, 1.0 }; // Idle subtle color
-        }
-        self.popBox(); // Close Resize Handle
-        // ----------------------------
-
         // 5. The Content Area
         var content = self.pushBox("content", BoxFlags{ .scrollable_y = true });
         content.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .percent_of_parent, .value = 100.0 } };
@@ -633,6 +598,44 @@ pub const UI = struct {
 
     pub fn endWindow(self: *UI) void {
         self.popBox(); // Close Content Area
+        // --- THE RESIZE HANDLE FIX ---
+        // Fetch the state using the context hash we saved in beginWindow!
+        if (self.retained_state.getPtr(self.current_window_hash)) |state| {
+            var resize_handle = self.pushBox("resize_handle", BoxFlags{
+                .floating = true, // Break layout!
+                // Notice: NO .is_popup = true! This binds it to the window's Z-layer!
+                .clickable = true,
+                .draw_background = true,
+            });
+
+            const handle_size = 15.0;
+            resize_handle.fixed_x = state.window_x + state.window_width - handle_size;
+            resize_handle.fixed_y = state.window_y + state.window_height - handle_size;
+            resize_handle.pref_size = .{ .{ .kind = .pixels, .value = handle_size }, .{ .kind = .pixels, .value = handle_size } };
+            resize_handle.corner_radius = 4.0;
+            resize_handle.z_index = state.persistent_z + 5;
+
+            if (self.active_hash == resize_handle.hash) {
+                resize_handle.bg_color = .{ 0.5, 0.5, 0.5, 1.0 };
+
+                if (self.input.mouse_left_pressed) {
+                    state.drag_offset_x = self.input.mouse_x - state.window_width;
+                    state.drag_offset_y = self.input.mouse_y - state.window_height;
+                }
+
+                state.window_width = self.input.mouse_x - state.drag_offset_x;
+                state.window_height = self.input.mouse_y - state.drag_offset_y;
+
+                state.window_width = @max(50.0, state.window_width);
+                state.window_height = @max(50.0, state.window_height);
+            } else if (self.hot_hash_this_frame == resize_handle.hash) {
+                resize_handle.bg_color = .{ 0.4, 0.4, 0.4, 0.8 };
+            } else {
+                resize_handle.bg_color = .{ 0.2, 0.2, 0.2, 0.5 };
+            }
+            self.popBox(); // Close Resize Handle
+        }
+        // -----------------------------
         self.popBox(); // Close Master Container
         self.current_window_hash = 0;
     }
@@ -729,7 +732,7 @@ pub const UI = struct {
 
         var child_it = node.first;
         while (child_it) |child| : (child_it = child.next) {
-            if (child.flags.is_popup) {
+            if (child.flags.is_popup or child.flags.floating) {
                 if (child.flags.floating) {
                     // Scrollbars: Pin to absolute screen coordinates!
                     child.rect.pos = .{ child.fixed_x, child.fixed_y };
