@@ -28,6 +28,7 @@ var image_loaded: bool = false;
 var my_graph_data: [50]f32 = undefined;
 var my_camera_yaw: f32 = 0.785; // 45 degrees
 var my_camera_pitch: f32 = 0.523; // 30 degrees
+var my_camera_zoom: f32 = 5.0;
 var is_3d_ready: bool = false;
 
 pub const Rect = struct {
@@ -1586,11 +1587,11 @@ pub const UI = struct {
         self.popBox();
     }
 
-    pub fn modelViewer(self: *UI, id_str: []const u8, render_target: Texture, width: f32, height: f32, yaw: *f32, pitch: *f32) void {
+    pub fn modelViewer(self: *UI, id_str: []const u8, render_target: Texture, width: f32, height: f32, yaw: *f32, pitch: *f32, zoom: *f32) void {
         const hash = self.generateId(id_str);
 
         // 1. Create an interactive box
-        var box = self.pushBox(id_str, BoxFlags{ .clickable = true, .draw_background = true });
+        var box = self.pushBox(id_str, BoxFlags{ .clickable = true, .draw_background = true, .scrollable_y = true });
 
         box.pref_size = .{ .{ .kind = .pixels, .value = width }, .{ .kind = .pixels, .value = height } };
         box.bg_color = .{ 0.0, 0.0, 0.0, 1.0 }; // Black background for the 3D scene
@@ -1598,6 +1599,16 @@ pub const UI = struct {
 
         // 2. Display the offscreen 3D texture!
         box.texture = render_target;
+
+        // --- ADD ZOOM MATH ---
+        if (self.hovered_scroll_hash == box.hash) {
+            // Apply mouse wheel delta
+            zoom.* -= self.input.scroll_y * 0.5; // 0.5 is the zoom speed sensitivity
+
+            // Clamp it so the camera doesn't fly through the object or too far away!
+            zoom.* = @max(1.0, @min(50.0, zoom.*));
+        }
+        // ---------------------
 
         // 3. Handle 3D Camera Orbiting
         if (self.active_hash == box.hash) {
@@ -2527,9 +2538,9 @@ const AppState = struct {
         self.pipeline_3d = c.wgpuDeviceCreateRenderPipeline(self.device, &pipeline_desc);
     }
 
-    pub fn render3DModel(self: *Self, yaw: f32, pitch: f32) void {
+    pub fn render3DModel(self: *Self, yaw: f32, pitch: f32, zoom: f32) void {
         // 1. Calculate MVP Math
-        const eye_dist: f32 = 5.0;
+        const eye_dist: f32 = zoom;
         const eye_x = @sin(yaw) * @cos(pitch) * eye_dist;
         const eye_y = @sin(pitch) * eye_dist;
         const eye_z = @cos(yaw) * @cos(pitch) * eye_dist;
@@ -2727,7 +2738,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     ui.label("Drag to rotate the model:");
 
     // The widget displays the render target, and updates our camera variables!
-    ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch);
+    ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch, &my_camera_zoom);
 
     //ui.endWindow();
 
@@ -2908,7 +2919,7 @@ pub fn main() !void {
         if (!running) break;
 
         if (is_3d_ready) {
-            app.render3DModel(my_camera_yaw, my_camera_pitch);
+            app.render3DModel(my_camera_yaw, my_camera_pitch, my_camera_zoom);
         }
 
         renderAppFrame(&app, &ui, current_input, dt, window_width, window_height);
