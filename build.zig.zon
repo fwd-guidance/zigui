@@ -1,7 +1,7 @@
 .{
-    .name = .wgpu_raytracer,
+    .name = .zigui,
     .version = "0.0.0",
-    .fingerprint = 0x97656df3ec7066e,
+    .fingerprint = 0x18d03e10b9219005,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .wgpu_native = .{ .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v27.0.4.0/wgpu-macos-aarch64-release.zip", .hash = "N-V-__8AAErMaQKC5QgAVKXwvDp_DYp8gSBeLeDgR_4PQNAc" },
