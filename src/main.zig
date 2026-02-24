@@ -2735,7 +2735,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
 
     //ui.beginWindow("Model Viewer", 100, 100, 400, 400);
 
-    ui.label("Drag to rotate the model:");
+    ui.label("Drag to rotate the model or mousewheel to zoom:");
 
     // The widget displays the render target, and updates our camera variables!
     ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch, &my_camera_zoom);
