@@ -43,6 +43,11 @@ pub const Vertex3D = extern struct {
     color: [3]f32,
 };
 
+pub const ModelData = struct {
+    vertices: []Vertex3D,
+    texture_path: ?[]u8, // We use an optional slice since models might not have textures!
+};
+
 pub const Math3D = struct {
     // Strictly Column-Major Multiplication
     pub fn mul(a: [16]f32, b: [16]f32) [16]f32 {
@@ -1639,9 +1644,9 @@ pub const UI = struct {
         }
 
         // Draw a subtle border when hovering
-        if (self.hot_hash_this_frame == box.hash) {
-            box.bg_color = .{ 0.2, 0.2, 0.2, 1.0 };
-        }
+        //if (self.hot_hash_this_frame == box.hash) {
+        //    box.bg_color = .{ 0.2, 0.2, 0.2, 1.0 };
+        //}
 
         self.popBox();
     }
@@ -1720,7 +1725,7 @@ const wgsl_shader =
     \\     } else if (in.type_flag == 2u) {
     \\         let tex_color = textureSample(diffuse_tex, diffuse_sampler, in.tex_uv);
     \\         if (tex_color.a <= 0.01) { discard; }
-    \\         return tex_color;
+    \\         return tex_color * in.color;
     \\     } else if (in.type_flag == 3u) {
     \\         let p = in.uv * in.box_size;
     \\         let a = in.raw_uv_min;
@@ -1751,6 +1756,8 @@ const wgsl_shader =
 const wgsl_shader_3d =
     \\ struct Uniforms { mvp: mat4x4<f32>, };
     \\ @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+    \\ @group(0) @binding(1) var t_diffuse: texture_2d<f32>;
+    \\ @group(0) @binding(2) var s_diffuse: sampler;
     \\
     \\ struct VertexInput {
     \\     @location(0) pos: vec3<f32>,
@@ -1762,23 +1769,33 @@ const wgsl_shader_3d =
     \\     @builtin(position) clip_pos: vec4<f32>,
     \\     @location(0) normal: vec3<f32>,
     \\     @location(1) color: vec3<f32>,
+    \\     @location(2) uv: vec2<f32>,
     \\ };
     \\
     \\ @vertex fn vs_main(model: VertexInput) -> VertexOutput {
     \\     var out: VertexOutput;
     \\     out.clip_pos = uniforms.mvp * vec4<f32>(model.pos, 1.0);
     \\     out.normal = model.normal;
-    \\     out.color = model.color; // Pass color to fragment shader
+    \\     out.color = model.color;
+    \\     out.uv = model.uv; // Pass the UVs!
     \\     return out;
     \\ }
     \\
     \\ @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     \\     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
     \\     let n = normalize(in.normal);
-    \\     let diffuse = max(dot(n, light_dir), 0.2); 
+    \\     let diffuse_light = max(dot(n, light_dir), 0.2); 
     \\     
-    \\     // Multiply the baked material color by the lighting!
-    \\     return vec4<f32>(in.color * diffuse, 1.0);
+    \\     // Sample the image texture at the current UV coordinates
+    \\     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
+    \\
+    \\     // If the MTL diffuse is pure black, default to pure white!
+    \\     let safe_color = max(in.color, vec3<f32>(0.01, 0.01, 0.01)) + step(length(in.color), 0.0) * vec3<f32>(1.0);
+    \\     
+    \\     // Multiply Image * Material Color * Lighting!
+    \\     let final_color = tex_color.rgb * safe_color * diffuse_light;
+    \\     
+    \\     return vec4<f32>(final_color, tex_color.a);
     \\ }
 ;
 
@@ -1812,6 +1829,10 @@ const AppState = struct {
     offscreen_view: c.WGPUTextureView, // Needed for the render pass
     depth_tex: c.WGPUTexture,
     depth_view: c.WGPUTextureView,
+
+    model_tex: c.WGPUTexture,
+    model_tex_view: c.WGPUTextureView,
+    model_sampler: c.WGPUSampler,
 
     const Self = @This();
 
@@ -2144,6 +2165,9 @@ const AppState = struct {
             .offscreen_view = undefined,
             .depth_tex = undefined,
             .depth_view = undefined,
+            .model_tex = undefined,
+            .model_tex_view = undefined,
+            .model_sampler = undefined,
         };
     }
 
@@ -2163,6 +2187,10 @@ const AppState = struct {
             c.wgpuTextureRelease(self.offscreen_tex.wgpu_tex);
             c.wgpuTextureViewRelease(self.depth_view);
             c.wgpuTextureRelease(self.depth_tex);
+
+            c.wgpuTextureViewRelease(self.model_tex_view);
+            c.wgpuTextureRelease(self.model_tex);
+            c.wgpuSamplerRelease(self.model_sampler);
         }
 
         c.wgpuQueueRelease(self.queue);
@@ -2355,7 +2383,7 @@ const AppState = struct {
         };
     }
 
-    pub fn init3DPipeline(self: *Self, verts: []Vertex3D) !void {
+    pub fn init3DPipeline(self: *Self, verts: []Vertex3D, texture_path: ?[]const u8) !void {
         // 1. Create the 3D VBO
         const vbo_desc = c.WGPUBufferDescriptor{
             .nextInChain = null,
@@ -2378,35 +2406,148 @@ const AppState = struct {
         };
         self.mvp_uniform_buf = c.wgpuDeviceCreateBuffer(self.device, &ubo_desc);
 
-        var bgl_entries_3d = [_]c.WGPUBindGroupLayoutEntry{std.mem.zeroes(c.WGPUBindGroupLayoutEntry)};
+        // --- 1. LOAD THE TEXTURE VIA STB_IMAGE ---
+        var img_w: c_int = 1;
+        var img_h: c_int = 1;
+        var img_channels: c_int = 4;
+        var img_data: [*c]u8 = null;
+
+        // Fallback: A 1x1 solid white pixel if the model has no texture!
+        var default_pixel = [_]u8{ 255, 255, 255, 255 };
+
+        if (texture_path) |path| {
+            // C-interop requires a null-terminated string
+            const null_term_path = try std.heap.page_allocator.dupeZ(u8, path);
+            defer std.heap.page_allocator.free(null_term_path);
+
+            img_data = c.stbi_load(null_term_path.ptr, &img_w, &img_h, &img_channels, 4);
+        }
+
+        if (img_data == null) {
+            img_data = &default_pixel;
+            img_w = 1;
+            img_h = 1;
+        }
+
+        // Upload to WebGPU
+        const m_tex_desc = c.WGPUTextureDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUTextureUsage_CopyDst | c.WGPUTextureUsage_TextureBinding,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = @intCast(img_w), .height = @intCast(img_h), .depthOrArrayLayers = 1 },
+            .format = c.WGPUTextureFormat_RGBA8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+            .viewFormatCount = 0,
+            .viewFormats = null,
+        };
+        self.model_tex = c.wgpuDeviceCreateTexture(self.device, &m_tex_desc);
+
+        const m_tex_copy = c.WGPUTexelCopyTextureInfo{
+            //.nextInChain = null,
+            .texture = self.model_tex,
+            .mipLevel = 0,
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .aspect = c.WGPUTextureAspect_All,
+        };
+        const m_layout = c.WGPUTexelCopyBufferLayout{
+            //.nextInChain = null,
+            .offset = 0,
+            .bytesPerRow = @intCast(img_w * 4),
+            .rowsPerImage = @intCast(img_h),
+        };
+        c.wgpuQueueWriteTexture(self.queue, &m_tex_copy, img_data, @intCast(img_w * img_h * 4), &m_layout, &m_tex_desc.size);
+
+        // Free stb memory
+        if (img_data != @as([*c]u8, @ptrCast(&default_pixel))) {
+            c.stbi_image_free(img_data);
+        }
+        // ------------------------------------------------------
+
+        self.model_tex_view = c.wgpuTextureCreateView(self.model_tex, null);
+
+        // Create 3D Sampler (Repeat wrapping for 3D UVs!)
+        const m_samp_desc = c.WGPUSamplerDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .addressModeU = c.WGPUAddressMode_Repeat,
+            .addressModeV = c.WGPUAddressMode_Repeat,
+            .addressModeW = c.WGPUAddressMode_Repeat,
+            .magFilter = c.WGPUFilterMode_Linear,
+            .minFilter = c.WGPUFilterMode_Linear,
+            .mipmapFilter = c.WGPUMipmapFilterMode_Linear,
+            .lodMinClamp = 0.0,
+            .lodMaxClamp = 32.0,
+            .compare = c.WGPUCompareFunction_Undefined,
+            .maxAnisotropy = 1,
+        };
+        self.model_sampler = c.wgpuDeviceCreateSampler(self.device, &m_samp_desc);
+
+        // --- 2. UPDATE BIND GROUP LAYOUT ---
+        var bgl_entries_3d = [_]c.WGPUBindGroupLayoutEntry{ std.mem.zeroes(c.WGPUBindGroupLayoutEntry), std.mem.zeroes(c.WGPUBindGroupLayoutEntry), std.mem.zeroes(c.WGPUBindGroupLayoutEntry) };
+
+        // 0: MVP Matrix
         bgl_entries_3d[0].binding = 0;
         bgl_entries_3d[0].visibility = c.WGPUShaderStage_Vertex;
         bgl_entries_3d[0].buffer.type = c.WGPUBufferBindingType_Uniform;
         bgl_entries_3d[0].buffer.minBindingSize = @sizeOf([16]f32);
+        // 1: Texture
+        bgl_entries_3d[1].binding = 1;
+        bgl_entries_3d[1].visibility = c.WGPUShaderStage_Fragment;
+        bgl_entries_3d[1].texture.sampleType = c.WGPUTextureSampleType_Float;
+        bgl_entries_3d[1].texture.viewDimension = c.WGPUTextureViewDimension_2D;
+        // 2: Sampler
+        bgl_entries_3d[2].binding = 2;
+        bgl_entries_3d[2].visibility = c.WGPUShaderStage_Fragment;
+        bgl_entries_3d[2].sampler.type = c.WGPUSamplerBindingType_Filtering;
 
-        const bgl_desc_3d = c.WGPUBindGroupLayoutDescriptor{
-            .nextInChain = null,
-            .label = .{ .data = null, .length = 0 },
-            .entryCount = 1,
-            .entries = &bgl_entries_3d,
-        };
+        const bgl_desc_3d = c.WGPUBindGroupLayoutDescriptor{ .nextInChain = null, .label = .{ .data = null, .length = 0 }, .entryCount = 3, .entries = &bgl_entries_3d };
         const bg_layout_3d = c.wgpuDeviceCreateBindGroupLayout(self.device, &bgl_desc_3d);
         defer c.wgpuBindGroupLayoutRelease(bg_layout_3d);
 
-        var bg_entries_3d = [_]c.WGPUBindGroupEntry{std.mem.zeroes(c.WGPUBindGroupEntry)};
+        // --- 3. CREATE THE BIND GROUP ---
+        var bg_entries_3d = [_]c.WGPUBindGroupEntry{ std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry) };
         bg_entries_3d[0].binding = 0;
         bg_entries_3d[0].buffer = self.mvp_uniform_buf;
-        bg_entries_3d[0].offset = 0;
         bg_entries_3d[0].size = @sizeOf([16]f32);
+        bg_entries_3d[1].binding = 1;
+        bg_entries_3d[1].textureView = self.model_tex_view;
+        bg_entries_3d[2].binding = 2;
+        bg_entries_3d[2].sampler = self.model_sampler;
 
-        const bg_desc_3d = c.WGPUBindGroupDescriptor{
-            .nextInChain = null,
-            .label = .{ .data = null, .length = 0 },
-            .layout = bg_layout_3d,
-            .entryCount = 1,
-            .entries = &bg_entries_3d,
-        };
+        const bg_desc_3d = c.WGPUBindGroupDescriptor{ .nextInChain = null, .label = .{ .data = null, .length = 0 }, .layout = bg_layout_3d, .entryCount = 3, .entries = &bg_entries_3d };
         self.bind_group_3d = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc_3d);
+
+        //var bgl_entries_3d = [_]c.WGPUBindGroupLayoutEntry{std.mem.zeroes(c.WGPUBindGroupLayoutEntry)};
+        //bgl_entries_3d[0].binding = 0;
+        //bgl_entries_3d[0].visibility = c.WGPUShaderStage_Vertex;
+        //bgl_entries_3d[0].buffer.type = c.WGPUBufferBindingType_Uniform;
+        //bgl_entries_3d[0].buffer.minBindingSize = @sizeOf([16]f32);
+
+        //const bgl_desc_3d = c.WGPUBindGroupLayoutDescriptor{
+        //    .nextInChain = null,
+        //    .label = .{ .data = null, .length = 0 },
+        //    .entryCount = 1,
+        //    .entries = &bgl_entries_3d,
+        //};
+        //const bg_layout_3d = c.wgpuDeviceCreateBindGroupLayout(self.device, &bgl_desc_3d);
+        //defer c.wgpuBindGroupLayoutRelease(bg_layout_3d);
+
+        //var bg_entries_3d = [_]c.WGPUBindGroupEntry{std.mem.zeroes(c.WGPUBindGroupEntry)};
+        //bg_entries_3d[0].binding = 0;
+        //bg_entries_3d[0].buffer = self.mvp_uniform_buf;
+        //bg_entries_3d[0].offset = 0;
+        //bg_entries_3d[0].size = @sizeOf([16]f32);
+
+        //const bg_desc_3d = c.WGPUBindGroupDescriptor{
+        //    .nextInChain = null,
+        //    .label = .{ .data = null, .length = 0 },
+        //    .layout = bg_layout_3d,
+        //    .entryCount = 1,
+        //    .entries = &bg_entries_3d,
+        //};
+        //self.bind_group_3d = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc_3d);
 
         // 3. Create Offscreen Color Target (400x400)
         const tex_size = 400;
@@ -2733,14 +2874,14 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     //ui.label("Memory usage: 14MB");
     //ui.endWindow();
 
-    //ui.beginWindow("Model Viewer", 100, 100, 400, 400);
+    ui.beginWindow("Model Viewer", 100, 100, 400, 400);
 
     ui.label("Drag to rotate the model or mousewheel to zoom:");
 
     // The widget displays the render target, and updates our camera variables!
     ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch, &my_camera_zoom);
 
-    //ui.endWindow();
+    ui.endWindow();
 
     ui.popBox();
 
@@ -2761,10 +2902,15 @@ pub fn main() !void {
         std.debug.print("Failed to load test.png! Error: {}\n", .{err});
     }
 
-    if (loadObjFlat(gpa.allocator(), "test_model.obj")) |model_verts| {
-        try app.init3DPipeline(model_verts);
+    if (loadObjFlat(gpa.allocator(), "test_model.obj")) |model_data| {
+        try app.init3DPipeline(model_data.vertices, model_data.texture_path);
         is_3d_ready = true;
-        gpa.allocator().free(model_verts); // Free it for now!
+
+        if (model_data.texture_path) |path| {
+            gpa.allocator().free(path);
+        }
+
+        gpa.allocator().free(model_data.vertices); // Free it for now!
     } else |err| {
         std.debug.print("Failed to load or init 3D model! Error: {}\n", .{err});
     }
@@ -3002,7 +3148,7 @@ fn tinyObjFileReader(ctx_ptr: ?*anyopaque, filename: [*c]const u8, is_mtl: c_int
     }
 }
 
-pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) ![]Vertex3D {
+pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) !ModelData {
     var attrib: c.tinyobj_attrib_t = undefined;
     var shapes: [*c]c.tinyobj_shape_t = null;
     var num_shapes: usize = 0;
@@ -3034,6 +3180,24 @@ pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) ![]Vert
 
     if (ret != c.TINYOBJ_SUCCESS) {
         return error.ObjParseFailed;
+    }
+
+    // --- EXTRACT THE TEXTURE PATH ---
+    var found_tex_path: ?[]u8 = null;
+
+    // Scan the parsed materials for the first diffuse texture it finds
+    if (materials != null and num_materials > 0) {
+        for (0..num_materials) |m_i| {
+            if (materials[m_i].diffuse_texname != null) {
+                // Convert the raw C-pointer to a Zig slice
+                const tex_c_str = materials[m_i].diffuse_texname;
+                const tex_slice = std.mem.span(tex_c_str);
+
+                // Duplicate it into our Zig allocator so it survives the C-memory cleanup!
+                found_tex_path = allocator.dupe(u8, tex_slice) catch null;
+                break; // Stop after finding the first texture
+            }
+        }
     }
 
     // Free the C-allocations made by tinyobj_loader internally
@@ -3095,5 +3259,5 @@ pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) ![]Vert
         try vertices.append(allocator, v);
     }
 
-    return vertices.toOwnedSlice(allocator);
+    return ModelData{ .vertices = try vertices.toOwnedSlice(allocator), .texture_path = found_tex_path };
 }
