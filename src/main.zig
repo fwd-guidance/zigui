@@ -7,6 +7,7 @@ const c = @cImport({
     @cInclude("webgpu/webgpu.h");
     @cInclude("stb_truetype.h");
     @cInclude("stb_image.h");
+    @cInclude("tinyobj_loader_c.h");
 });
 
 // ==========================================
@@ -25,10 +26,67 @@ const dropdown_options = [_][]const u8{ "Low", "Medium", "High", "Ultra" };
 var my_image: Texture = undefined;
 var image_loaded: bool = false;
 var my_graph_data: [50]f32 = undefined;
+var my_camera_yaw: f32 = 0.785; // 45 degrees
+var my_camera_pitch: f32 = 0.523; // 30 degrees
+var is_3d_ready: bool = false;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
     size: [2]f32 = .{ 0.0, 0.0 },
+};
+
+pub const Vertex3D = extern struct {
+    position: [3]f32,
+    normal: [3]f32,
+    uv: [2]f32,
+    color: [3]f32,
+};
+
+pub const Math3D = struct {
+    // Strictly Column-Major Multiplication
+    pub fn mul(a: [16]f32, b: [16]f32) [16]f32 {
+        var out = std.mem.zeroes([16]f32);
+        for (0..4) |col| {
+            for (0..4) |row| {
+                for (0..4) |i| {
+                    out[col * 4 + row] += a[i * 4 + row] * b[col * 4 + i];
+                }
+            }
+        }
+        return out;
+    }
+
+    // WebGPU specific perspective (Z maps to 0.0 to 1.0)
+    pub fn perspective(fovy_rad: f32, aspect: f32, near: f32, far: f32) [16]f32 {
+        const f = 1.0 / @tan(fovy_rad / 2.0);
+        var out = std.mem.zeroes([16]f32);
+        out[0] = f / aspect;
+        out[5] = f;
+        out[10] = far / (near - far);
+        out[11] = -1.0;
+        out[14] = (far * near) / (near - far);
+        return out;
+    }
+
+    // (lookAt remains exactly the same, it was already column-major!)
+    pub fn lookAt(eye: [3]f32, center: [3]f32, up: [3]f32) [16]f32 {
+        var f = [3]f32{ center[0] - eye[0], center[1] - eye[1], center[2] - eye[2] };
+        const f_len = @sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        f = .{ f[0] / f_len, f[1] / f_len, f[2] / f_len };
+
+        var s = [3]f32{ f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0] };
+        const s_len = @sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+        s = .{ s[0] / s_len, s[1] / s_len, s[2] / s_len };
+
+        const u = [3]f32{ s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0] };
+
+        return [16]f32{
+            s[0],                                             u[0],                                             -f[0],                                         0.0,
+            s[1],                                             u[1],                                             -f[1],                                         0.0,
+            s[2],                                             u[2],                                             -f[2],                                         0.0,
+            -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]), -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]), f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2], 1.0,
+        };
+    }
 };
 
 pub const SizeKind = enum { pixels, percent_of_parent, text_content, children_sum };
@@ -846,21 +904,6 @@ pub const UI = struct {
             state.last_frame_z_index = node.z_index;
         }
 
-        // --- TEXTURE BATCH BREAKING ---
-        if (node.texture != null) {
-            instances.append(self.allocator, InstanceData{
-                .rect_pos = node.rect.pos,
-                .rect_size = node.rect.size,
-                .color = .{ 1.0, 1.0, 1.0, 1.0 },
-                .clip_rect = node.clip_rect,
-                .corner_radius = node.corner_radius,
-                .edge_softness = 0.0,
-                .type_flag = 2, // 2 = Image Texture!
-                .uv_min = .{ 0.0, 0.0 },
-                .uv_max = .{ 1.0, 1.0 },
-            }) catch unreachable;
-        }
-
         if (node.flags.draw_background) {
             instances.append(self.allocator, InstanceData{
                 .rect_pos = node.rect.pos,
@@ -874,6 +917,21 @@ pub const UI = struct {
                 .uv_max = .{ 0.0, 0.0 },
             }) catch unreachable;
             //draw_cmds.items[draw_cmds.items.len - 1].instance_count += 1; // <-- ADD THIS AFTER EVERY APPEND!
+        }
+
+        // --- TEXTURE BATCH BREAKING ---
+        if (node.texture != null) {
+            instances.append(self.allocator, InstanceData{
+                .rect_pos = node.rect.pos,
+                .rect_size = node.rect.size,
+                .color = .{ 1.0, 1.0, 1.0, 1.0 },
+                .clip_rect = node.clip_rect,
+                .corner_radius = node.corner_radius,
+                .edge_softness = 0.0,
+                .type_flag = 2, // 2 = Image Texture!
+                .uv_min = .{ 0.0, 0.0 },
+                .uv_max = .{ 1.0, 1.0 },
+            }) catch unreachable;
         }
 
         // --- DRAW LINE GRAPH SEGMENTS ---
@@ -1527,6 +1585,55 @@ pub const UI = struct {
 
         self.popBox();
     }
+
+    pub fn modelViewer(self: *UI, id_str: []const u8, render_target: Texture, width: f32, height: f32, yaw: *f32, pitch: *f32) void {
+        const hash = self.generateId(id_str);
+
+        // 1. Create an interactive box
+        var box = self.pushBox(id_str, BoxFlags{ .clickable = true, .draw_background = true });
+
+        box.pref_size = .{ .{ .kind = .pixels, .value = width }, .{ .kind = .pixels, .value = height } };
+        box.bg_color = .{ 0.0, 0.0, 0.0, 1.0 }; // Black background for the 3D scene
+        box.corner_radius = 4.0;
+
+        // 2. Display the offscreen 3D texture!
+        box.texture = render_target;
+
+        // 3. Handle 3D Camera Orbiting
+        if (self.active_hash == box.hash) {
+            if (self.retained_state.getPtr(hash)) |state| {
+                // On the exact frame we click, cache the mouse position
+                if (self.input.mouse_left_pressed) {
+                    state.drag_offset_x = self.input.mouse_x;
+                    state.drag_offset_y = self.input.mouse_y;
+                }
+
+                // Calculate how far the mouse moved since last frame
+                const dx = self.input.mouse_x - state.drag_offset_x;
+                const dy = self.input.mouse_y - state.drag_offset_y;
+
+                // Apply sensitivity and update the camera angles
+                const sensitivity = 0.01;
+                yaw.* += dx * sensitivity;
+                pitch.* += dy * sensitivity;
+
+                // Clamp pitch so the camera doesn't flip upside down!
+                const pitch_limit = std.math.pi / 2.0 - 0.1;
+                pitch.* = @max(-pitch_limit, @min(pitch_limit, pitch.*));
+
+                // Reset the tracker so we get continuous deltas while dragging
+                state.drag_offset_x = self.input.mouse_x;
+                state.drag_offset_y = self.input.mouse_y;
+            }
+        }
+
+        // Draw a subtle border when hovering
+        if (self.hot_hash_this_frame == box.hash) {
+            box.bg_color = .{ 0.2, 0.2, 0.2, 1.0 };
+        }
+
+        self.popBox();
+    }
 };
 
 // ==========================================
@@ -1630,6 +1737,40 @@ const wgsl_shader =
     \\ }
 ;
 
+const wgsl_shader_3d =
+    \\ struct Uniforms { mvp: mat4x4<f32>, };
+    \\ @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+    \\
+    \\ struct VertexInput {
+    \\     @location(0) pos: vec3<f32>,
+    \\     @location(1) normal: vec3<f32>,
+    \\     @location(2) uv: vec2<f32>,
+    \\     @location(3) color: vec3<f32>,
+    \\ };
+    \\ struct VertexOutput {
+    \\     @builtin(position) clip_pos: vec4<f32>,
+    \\     @location(0) normal: vec3<f32>,
+    \\     @location(1) color: vec3<f32>,
+    \\ };
+    \\
+    \\ @vertex fn vs_main(model: VertexInput) -> VertexOutput {
+    \\     var out: VertexOutput;
+    \\     out.clip_pos = uniforms.mvp * vec4<f32>(model.pos, 1.0);
+    \\     out.normal = model.normal;
+    \\     out.color = model.color; // Pass color to fragment shader
+    \\     return out;
+    \\ }
+    \\
+    \\ @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    \\     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    \\     let n = normalize(in.normal);
+    \\     let diffuse = max(dot(n, light_dir), 0.2); 
+    \\     
+    \\     // Multiply the baked material color by the lighting!
+    \\     return vec4<f32>(in.color * diffuse, 1.0);
+    \\ }
+;
+
 const AppState = struct {
     window: ?*c.RGFW_window,
     instance: c.WGPUInstance,
@@ -1648,6 +1789,18 @@ const AppState = struct {
     screen_uniform_buf: c.WGPUBuffer,
 
     bind_group_layout: c.WGPUBindGroupLayout,
+
+    // --- 3D Pipeline Additions ---
+    pipeline_3d: c.WGPURenderPipeline,
+    vbo_3d: c.WGPUBuffer,
+    num_3d_verts: u32,
+    mvp_uniform_buf: c.WGPUBuffer,
+    bind_group_3d: c.WGPUBindGroup,
+
+    offscreen_tex: Texture,
+    offscreen_view: c.WGPUTextureView, // Needed for the render pass
+    depth_tex: c.WGPUTexture,
+    depth_view: c.WGPUTextureView,
 
     const Self = @This();
 
@@ -1971,6 +2124,15 @@ const AppState = struct {
             .font = font,
             .screen_uniform_buf = screen_uniform_buf,
             .bind_group_layout = bind_group_layout,
+            .pipeline_3d = undefined,
+            .vbo_3d = undefined,
+            .num_3d_verts = 0,
+            .mvp_uniform_buf = undefined,
+            .bind_group_3d = undefined,
+            .offscreen_tex = undefined,
+            .offscreen_view = undefined,
+            .depth_tex = undefined,
+            .depth_view = undefined,
         };
     }
 
@@ -1979,6 +2141,18 @@ const AppState = struct {
         c.wgpuBufferRelease(self.vbo);
         c.wgpuBufferRelease(self.ibo);
         c.wgpuRenderPipelineRelease(self.pipeline);
+
+        if (self.num_3d_verts > 0) {
+            c.wgpuRenderPipelineRelease(self.pipeline_3d);
+            c.wgpuBufferRelease(self.vbo_3d);
+            c.wgpuBufferRelease(self.mvp_uniform_buf);
+            c.wgpuBindGroupRelease(self.bind_group_3d);
+
+            c.wgpuTextureViewRelease(self.offscreen_view);
+            c.wgpuTextureRelease(self.offscreen_tex.wgpu_tex);
+            c.wgpuTextureViewRelease(self.depth_view);
+            c.wgpuTextureRelease(self.depth_tex);
+        }
 
         c.wgpuQueueRelease(self.queue);
         c.wgpuDeviceRelease(self.device);
@@ -2169,6 +2343,250 @@ const AppState = struct {
             .height = @intCast(height),
         };
     }
+
+    pub fn init3DPipeline(self: *Self, verts: []Vertex3D) !void {
+        // 1. Create the 3D VBO
+        const vbo_desc = c.WGPUBufferDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUBufferUsage_Vertex | c.WGPUBufferUsage_CopyDst,
+            .size = verts.len * @sizeOf(Vertex3D),
+            .mappedAtCreation = 0,
+        };
+        self.vbo_3d = c.wgpuDeviceCreateBuffer(self.device, &vbo_desc);
+        c.wgpuQueueWriteBuffer(self.queue, self.vbo_3d, 0, verts.ptr, verts.len * @sizeOf(Vertex3D));
+        self.num_3d_verts = @intCast(verts.len);
+
+        // 2. 3D MVP Uniform Buffer & Bind Group
+        const ubo_desc = c.WGPUBufferDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst,
+            .size = @sizeOf([16]f32),
+            .mappedAtCreation = 0,
+        };
+        self.mvp_uniform_buf = c.wgpuDeviceCreateBuffer(self.device, &ubo_desc);
+
+        var bgl_entries_3d = [_]c.WGPUBindGroupLayoutEntry{std.mem.zeroes(c.WGPUBindGroupLayoutEntry)};
+        bgl_entries_3d[0].binding = 0;
+        bgl_entries_3d[0].visibility = c.WGPUShaderStage_Vertex;
+        bgl_entries_3d[0].buffer.type = c.WGPUBufferBindingType_Uniform;
+        bgl_entries_3d[0].buffer.minBindingSize = @sizeOf([16]f32);
+
+        const bgl_desc_3d = c.WGPUBindGroupLayoutDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .entryCount = 1,
+            .entries = &bgl_entries_3d,
+        };
+        const bg_layout_3d = c.wgpuDeviceCreateBindGroupLayout(self.device, &bgl_desc_3d);
+        defer c.wgpuBindGroupLayoutRelease(bg_layout_3d);
+
+        var bg_entries_3d = [_]c.WGPUBindGroupEntry{std.mem.zeroes(c.WGPUBindGroupEntry)};
+        bg_entries_3d[0].binding = 0;
+        bg_entries_3d[0].buffer = self.mvp_uniform_buf;
+        bg_entries_3d[0].offset = 0;
+        bg_entries_3d[0].size = @sizeOf([16]f32);
+
+        const bg_desc_3d = c.WGPUBindGroupDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .layout = bg_layout_3d,
+            .entryCount = 1,
+            .entries = &bg_entries_3d,
+        };
+        self.bind_group_3d = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc_3d);
+
+        // 3. Create Offscreen Color Target (400x400)
+        const tex_size = 400;
+        const color_desc = c.WGPUTextureDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUTextureUsage_RenderAttachment | c.WGPUTextureUsage_TextureBinding,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = tex_size, .height = tex_size, .depthOrArrayLayers = 1 },
+            .format = c.WGPUTextureFormat_BGRA8Unorm, // Same as UI surface format
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+            .viewFormatCount = 0,
+            .viewFormats = null,
+        };
+        const offscreen_wgpu_tex = c.wgpuDeviceCreateTexture(self.device, &color_desc);
+        self.offscreen_view = c.wgpuTextureCreateView(offscreen_wgpu_tex, null);
+
+        // 4. Create Depth Buffer Target (400x400)
+        const depth_desc = c.WGPUTextureDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUTextureUsage_RenderAttachment,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = tex_size, .height = tex_size, .depthOrArrayLayers = 1 },
+            .format = c.WGPUTextureFormat_Depth24Plus,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+            .viewFormatCount = 0,
+            .viewFormats = null,
+        };
+        self.depth_tex = c.wgpuDeviceCreateTexture(self.device, &depth_desc);
+        self.depth_view = c.wgpuTextureCreateView(self.depth_tex, null);
+
+        // 5. Wrap the offscreen texture into a UI Bind Group so the UI can draw it!
+        const sampler_desc = c.WGPUSamplerDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .addressModeU = c.WGPUAddressMode_ClampToEdge,
+            .addressModeV = c.WGPUAddressMode_ClampToEdge,
+            .addressModeW = c.WGPUAddressMode_ClampToEdge,
+            .magFilter = c.WGPUFilterMode_Linear,
+            .minFilter = c.WGPUFilterMode_Linear,
+            .mipmapFilter = c.WGPUMipmapFilterMode_Linear,
+            .lodMinClamp = 0.0,
+            .lodMaxClamp = 32.0,
+            .compare = c.WGPUCompareFunction_Undefined,
+            .maxAnisotropy = 1,
+        };
+        const sampler = c.wgpuDeviceCreateSampler(self.device, &sampler_desc);
+
+        var ui_bg_entries = [_]c.WGPUBindGroupEntry{ std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry) };
+        ui_bg_entries[0].binding = 0;
+        ui_bg_entries[0].textureView = self.offscreen_view;
+        ui_bg_entries[1].binding = 1;
+        ui_bg_entries[1].sampler = sampler;
+        ui_bg_entries[2].binding = 2;
+        ui_bg_entries[2].buffer = self.screen_uniform_buf;
+        ui_bg_entries[2].offset = 0;
+        ui_bg_entries[2].size = @sizeOf([2]f32);
+
+        const ui_bg_desc = c.WGPUBindGroupDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .layout = self.bind_group_layout,
+            .entryCount = 3,
+            .entries = &ui_bg_entries,
+        };
+        self.offscreen_tex = Texture{
+            .wgpu_tex = offscreen_wgpu_tex,
+            .bind_group = c.wgpuDeviceCreateBindGroup(self.device, &ui_bg_desc),
+            .width = tex_size,
+            .height = tex_size,
+        };
+
+        // 6. Create the 3D Render Pipeline
+        const wgsl_source = c.WGPUShaderSourceWGSL{ .chain = .{ .next = null, .sType = c.WGPUSType_ShaderSourceWGSL }, .code = .{ .data = wgsl_shader_3d.ptr, .length = wgsl_shader_3d.len } };
+        const shader_desc = c.WGPUShaderModuleDescriptor{ .nextInChain = @ptrCast(&wgsl_source), .label = .{ .data = null, .length = 0 } };
+        const shader = c.wgpuDeviceCreateShaderModule(self.device, &shader_desc);
+
+        const vertex_attributes = [_]c.WGPUVertexAttribute{
+            .{ .format = c.WGPUVertexFormat_Float32x3, .offset = @offsetOf(Vertex3D, "position"), .shaderLocation = 0 },
+            .{ .format = c.WGPUVertexFormat_Float32x3, .offset = @offsetOf(Vertex3D, "normal"), .shaderLocation = 1 },
+            .{ .format = c.WGPUVertexFormat_Float32x2, .offset = @offsetOf(Vertex3D, "uv"), .shaderLocation = 2 },
+            .{ .format = c.WGPUVertexFormat_Float32x3, .offset = @offsetOf(Vertex3D, "color"), .shaderLocation = 3 },
+        };
+        const vbo_layout = c.WGPUVertexBufferLayout{
+            .arrayStride = @sizeOf(Vertex3D),
+            .stepMode = c.WGPUVertexStepMode_Vertex,
+            .attributeCount = 4,
+            .attributes = &vertex_attributes,
+        };
+
+        const depth_state = c.WGPUDepthStencilState{
+            .nextInChain = null,
+            .format = c.WGPUTextureFormat_Depth24Plus,
+            .depthWriteEnabled = 1,
+            .depthCompare = c.WGPUCompareFunction_Less,
+            .stencilFront = .{ .compare = c.WGPUCompareFunction_Always, .failOp = c.WGPUStencilOperation_Keep, .depthFailOp = c.WGPUStencilOperation_Keep, .passOp = c.WGPUStencilOperation_Keep },
+            .stencilBack = .{ .compare = c.WGPUCompareFunction_Always, .failOp = c.WGPUStencilOperation_Keep, .depthFailOp = c.WGPUStencilOperation_Keep, .passOp = c.WGPUStencilOperation_Keep },
+            .stencilReadMask = 0,
+            .stencilWriteMask = 0,
+            .depthBias = 0,
+            .depthBiasSlopeScale = 0.0,
+            .depthBiasClamp = 0.0,
+        };
+
+        const color_target = c.WGPUColorTargetState{
+            .nextInChain = null,
+            .format = c.WGPUTextureFormat_BGRA8Unorm,
+            .blend = null,
+            .writeMask = c.WGPUColorWriteMask_All,
+        };
+        const fragment_state = c.WGPUFragmentState{ .nextInChain = null, .module = shader, .entryPoint = .{ .data = "fs_main", .length = 7 }, .constantCount = 0, .constants = null, .targetCount = 1, .targets = &color_target };
+
+        const pipeline_layout_desc = c.WGPUPipelineLayoutDescriptor{ .nextInChain = null, .label = .{ .data = null, .length = 0 }, .bindGroupLayoutCount = 1, .bindGroupLayouts = &bg_layout_3d };
+        const pipeline_layout = c.wgpuDeviceCreatePipelineLayout(self.device, &pipeline_layout_desc);
+
+        const pipeline_desc = c.WGPURenderPipelineDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .layout = pipeline_layout,
+            .vertex = .{ .nextInChain = null, .module = shader, .entryPoint = .{ .data = "vs_main", .length = 7 }, .constantCount = 0, .constants = null, .bufferCount = 1, .buffers = &vbo_layout },
+            .primitive = .{ .nextInChain = null, .topology = c.WGPUPrimitiveTopology_TriangleList, .stripIndexFormat = c.WGPUIndexFormat_Undefined, .frontFace = c.WGPUFrontFace_CCW, .cullMode = c.WGPUCullMode_None },
+            .depthStencil = &depth_state,
+            .multisample = .{ .nextInChain = null, .count = 1, .mask = 0xFFFFFFFF, .alphaToCoverageEnabled = 0 },
+            .fragment = &fragment_state,
+        };
+        self.pipeline_3d = c.wgpuDeviceCreateRenderPipeline(self.device, &pipeline_desc);
+    }
+
+    pub fn render3DModel(self: *Self, yaw: f32, pitch: f32) void {
+        // 1. Calculate MVP Math
+        const eye_dist: f32 = 5.0;
+        const eye_x = @sin(yaw) * @cos(pitch) * eye_dist;
+        const eye_y = @sin(pitch) * eye_dist;
+        const eye_z = @cos(yaw) * @cos(pitch) * eye_dist;
+
+        const view = Math3D.lookAt(.{ eye_x, eye_y, eye_z }, .{ 0.0, 0.0, 0.0 }, .{ 0.0, 1.0, 0.0 });
+        const proj = Math3D.perspective(std.math.pi / 4.0, 1.0, 0.1, 100.0);
+        const mvp = Math3D.mul(proj, view);
+
+        c.wgpuQueueWriteBuffer(self.queue, self.mvp_uniform_buf, 0, &mvp, @sizeOf([16]f32));
+
+        // 2. Begin Offscreen Pass
+        const encoder = c.wgpuDeviceCreateCommandEncoder(self.device, null);
+
+        const color_attachment = c.WGPURenderPassColorAttachment{
+            .view = self.offscreen_view,
+            .loadOp = c.WGPULoadOp_Clear,
+            .storeOp = c.WGPUStoreOp_Store,
+            .clearValue = .{ .r = 0.05, .g = 0.05, .b = 0.05, .a = 1.0 }, // Dark grey background
+            .depthSlice = c.WGPU_DEPTH_SLICE_UNDEFINED,
+            .resolveTarget = null,
+        };
+
+        const depth_attachment = c.WGPURenderPassDepthStencilAttachment{
+            .view = self.depth_view,
+            .depthLoadOp = c.WGPULoadOp_Clear,
+            .depthStoreOp = c.WGPUStoreOp_Store,
+            .depthClearValue = 1.0,
+            .depthReadOnly = 0,
+            .stencilLoadOp = c.WGPULoadOp_Undefined,
+            .stencilStoreOp = c.WGPUStoreOp_Undefined,
+            .stencilClearValue = 0,
+            .stencilReadOnly = 1,
+        };
+
+        const pass_desc = c.WGPURenderPassDescriptor{
+            .colorAttachmentCount = 1,
+            .colorAttachments = &color_attachment,
+            .depthStencilAttachment = &depth_attachment,
+            .occlusionQuerySet = null,
+            .timestampWrites = null,
+            .label = .{ .data = null, .length = 0 },
+        };
+        const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+
+        // 3. Draw!
+        c.wgpuRenderPassEncoderSetPipeline(pass, self.pipeline_3d);
+        c.wgpuRenderPassEncoderSetBindGroup(pass, 0, self.bind_group_3d, 0, null);
+        c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.vbo_3d, 0, c.WGPU_WHOLE_SIZE);
+        c.wgpuRenderPassEncoderDraw(pass, self.num_3d_verts, 1, 0, 0);
+
+        c.wgpuRenderPassEncoderEnd(pass);
+        c.wgpuRenderPassEncoderRelease(pass);
+
+        const cmd_buf = c.wgpuCommandEncoderFinish(encoder, null);
+        c.wgpuQueueSubmit(self.queue, 1, &cmd_buf);
+        c.wgpuCommandBufferRelease(cmd_buf);
+    }
 };
 
 // ==========================================
@@ -2285,24 +2703,33 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     ui.graph("my_chart", &my_graph_data, 0.0, 100.0, 500.0, 150.0);
 
     // Open a floating window at X: 400, Y: 100
-    ui.beginWindow("Inspector", 400.0, 100.0, 700.0, 400.0);
+    //ui.beginWindow("Inspector", 400.0, 100.0, 700.0, 400.0);
 
-    ui.label("[b]Floating Tool Palette[/]");
+    //ui.label("[b]Floating Tool Palette[/]");
 
-    if (ui.buttonFullWidth("Reset Settings", .{})) {
-        master_volume = 0.5;
-        graphics_quality = 1;
-        counter = 0;
-    }
+    //if (ui.buttonFullWidth("Reset Settings", .{})) {
+    //    master_volume = 0.5;
+    //    graphics_quality = 1;
+    //    counter = 0;
+    //}
 
-    _ = ui.slider("Volume Override", &master_volume, 0.0, 1.0);
+    //_ = ui.slider("Volume Override", &master_volume, 0.0, 1.0);
 
-    ui.endWindow();
+    //ui.endWindow();
 
-    ui.beginWindow("Debug Stats", 450.0, 150.0, 300.0, 400.0);
-    ui.label("Frames per second: 60");
-    ui.label("Memory usage: 14MB");
-    ui.endWindow();
+    //ui.beginWindow("Debug Stats", 450.0, 150.0, 300.0, 400.0);
+    //ui.label("Frames per second: 60");
+    //ui.label("Memory usage: 14MB");
+    //ui.endWindow();
+
+    //ui.beginWindow("Model Viewer", 100, 100, 400, 400);
+
+    ui.label("Drag to rotate the model:");
+
+    // The widget displays the render target, and updates our camera variables!
+    ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch);
+
+    //ui.endWindow();
 
     ui.popBox();
 
@@ -2321,6 +2748,14 @@ pub fn main() !void {
         image_loaded = true;
     } else |err| {
         std.debug.print("Failed to load test.png! Error: {}\n", .{err});
+    }
+
+    if (loadObjFlat(gpa.allocator(), "test_model.obj")) |model_verts| {
+        try app.init3DPipeline(model_verts);
+        is_3d_ready = true;
+        gpa.allocator().free(model_verts); // Free it for now!
+    } else |err| {
+        std.debug.print("Failed to load or init 3D model! Error: {}\n", .{err});
     }
 
     var window_width: u32 = 800;
@@ -2472,6 +2907,10 @@ pub fn main() !void {
 
         if (!running) break;
 
+        if (is_3d_ready) {
+            app.render3DModel(my_camera_yaw, my_camera_pitch);
+        }
+
         renderAppFrame(&app, &ui, current_input, dt, window_width, window_height);
     }
 }
@@ -2526,4 +2965,124 @@ fn requestDeviceCallback(status: c.WGPURequestDeviceStatus, device: c.WGPUDevice
     _ = userdata2;
     const device_ptr: *c.WGPUDevice = @ptrCast(@alignCast(userdata1));
     device_ptr.* = device;
+}
+
+const FileContext = struct {
+    allocator: std.mem.Allocator,
+    file_buffer: ?[]u8,
+};
+
+// C-ABI compatible callback for tinyobj_loader
+fn tinyObjFileReader(ctx_ptr: ?*anyopaque, filename: [*c]const u8, is_mtl: c_int, obj_filename: [*c]const u8, out_buf: [*c][*c]u8, out_len: [*c]usize) callconv(.c) void {
+    _ = is_mtl;
+    _ = obj_filename;
+
+    var ctx: *FileContext = @ptrCast(@alignCast(ctx_ptr));
+    const path = std.mem.span(filename);
+
+    // Read the file into Zig memory
+    if (std.fs.cwd().readFileAlloc(ctx.allocator, path, 1024 * 1024 * 50)) |file_data| {
+        ctx.file_buffer = file_data;
+        out_buf.* = file_data.ptr;
+        out_len.* = file_data.len;
+    } else |_| {
+        out_buf.* = null;
+        out_len.* = 0;
+    }
+}
+
+pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) ![]Vertex3D {
+    var attrib: c.tinyobj_attrib_t = undefined;
+    var shapes: [*c]c.tinyobj_shape_t = null;
+    var num_shapes: usize = 0;
+    var materials: [*c]c.tinyobj_material_t = null;
+    var num_materials: usize = 0;
+
+    var ctx = FileContext{
+        .allocator = allocator,
+        .file_buffer = null,
+    };
+
+    // Force the loader to convert quads/n-gons into triangles!
+    const flags = c.TINYOBJ_FLAG_TRIANGULATE;
+
+    const ret = c.tinyobj_parse_obj(
+        &attrib,
+        &shapes,
+        &num_shapes,
+        &materials,
+        &num_materials,
+        filepath,
+        tinyObjFileReader,
+        &ctx,
+        flags,
+    );
+
+    // Free the raw text buffer we allocated in the callback
+    defer if (ctx.file_buffer) |buf| allocator.free(buf);
+
+    if (ret != c.TINYOBJ_SUCCESS) {
+        return error.ObjParseFailed;
+    }
+
+    // Free the C-allocations made by tinyobj_loader internally
+    defer c.tinyobj_attrib_free(&attrib);
+    defer c.tinyobj_shapes_free(shapes, num_shapes);
+    defer c.tinyobj_materials_free(materials, num_materials);
+
+    var vertices = std.ArrayList(Vertex3D){};
+    errdefer vertices.deinit(allocator);
+
+    // --- UNROLL THE VERTICES ---
+    // attrib.num_faces represents the total number of index triplets.
+    // --- UNROLL THE VERTICES ---
+    for (0..attrib.num_faces) |i| {
+        const idx = attrib.faces[i];
+
+        // 1. FETCH MATERIAL COLOR
+        const mat_id = attrib.material_ids[i / 3];
+        var face_color = [3]f32{ 0.8, 0.8, 0.8 }; // Default to light grey
+
+        // If the face has a valid material, read its diffuse color!
+        if (mat_id >= 0 and materials != null) {
+            const mat = materials[@intCast(mat_id)];
+            face_color[0] = mat.diffuse[0];
+            face_color[1] = mat.diffuse[1];
+            face_color[2] = mat.diffuse[2];
+        }
+
+        var v = Vertex3D{
+            .position = .{ 0.0, 0.0, 0.0 },
+            .normal = .{ 0.0, 1.0, 0.0 },
+            .uv = .{ 0.0, 0.0 },
+            .color = face_color, // Assign it here!
+        };
+
+        // 1. Extract Position
+        if (idx.v_idx >= 0) {
+            const v_offset = @as(usize, @intCast(idx.v_idx)) * 3;
+            v.position[0] = attrib.vertices[v_offset + 0];
+            v.position[1] = attrib.vertices[v_offset + 1];
+            v.position[2] = attrib.vertices[v_offset + 2];
+        }
+
+        // 2. Extract Normal
+        if (idx.vn_idx >= 0) {
+            const vn_offset = @as(usize, @intCast(idx.vn_idx)) * 3;
+            v.normal[0] = attrib.normals[vn_offset + 0];
+            v.normal[1] = attrib.normals[vn_offset + 1];
+            v.normal[2] = attrib.normals[vn_offset + 2];
+        }
+
+        // 3. Extract UV (and flip V axis for WebGPU)
+        if (idx.vt_idx >= 0) {
+            const vt_offset = @as(usize, @intCast(idx.vt_idx)) * 2;
+            v.uv[0] = attrib.texcoords[vt_offset + 0];
+            v.uv[1] = 1.0 - attrib.texcoords[vt_offset + 1];
+        }
+
+        try vertices.append(allocator, v);
+    }
+
+    return vertices.toOwnedSlice(allocator);
 }
