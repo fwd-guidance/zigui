@@ -30,6 +30,11 @@ var my_camera_yaw: f32 = 0.785; // 45 degrees
 var my_camera_pitch: f32 = 0.523; // 30 degrees
 var my_camera_zoom: f32 = 5.0;
 var is_3d_ready: bool = false;
+var my_light_x: f32 = 0.5;
+var my_ambient: f32 = 0.2;
+var my_wobble: f32 = 0.0;
+var total_time: f32 = 0.0;
+var available_models: std.ArrayList([:0]const u8) = undefined;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -46,6 +51,16 @@ pub const Vertex3D = extern struct {
 pub const ModelData = struct {
     vertices: []Vertex3D,
     texture_path: ?[]u8, // We use an optional slice since models might not have textures!
+};
+
+// 96 bytes total, perfectly aligned for WebGPU!
+pub const UniformData = extern struct {
+    mvp: [16]f32, // 64 bytes
+    light_dir: [3]f32, // 12 bytes
+    ambient: f32, // 4 bytes
+    wobble_intensity: f32, // 4 bytes
+    time: f32, // 4 bytes
+    padding: [2]f32, // 8 bytes (forces 16-byte alignment)
 };
 
 pub const Math3D = struct {
@@ -1754,7 +1769,14 @@ const wgsl_shader =
 ;
 
 const wgsl_shader_3d =
-    \\ struct Uniforms { mvp: mat4x4<f32>, };
+    \\ struct Uniforms { 
+    \\     mvp: mat4x4<f32>, 
+    \\     light_dir: vec3<f32>,
+    \\     ambient: f32,
+    \\     wobble: f32,
+    \\     time: f32,
+    \\     padding: vec2<f32>,
+    \\ };
     \\ @group(0) @binding(0) var<uniform> uniforms: Uniforms;
     \\ @group(0) @binding(1) var t_diffuse: texture_2d<f32>;
     \\ @group(0) @binding(2) var s_diffuse: sampler;
@@ -1774,25 +1796,30 @@ const wgsl_shader_3d =
     \\
     \\ @vertex fn vs_main(model: VertexInput) -> VertexOutput {
     \\     var out: VertexOutput;
-    \\     out.clip_pos = uniforms.mvp * vec4<f32>(model.pos, 1.0);
+    \\     
+    \\     // --- THE WOBBLE EFFECT ---
+    \\     // Calculate a wave based on the Y position and Time
+    \\     let wave = sin(model.pos.y * 10.0 + uniforms.time * 5.0);
+    \\     // Push the vertex outward along its normal
+    \\     let displaced_pos = model.pos + (model.normal * wave * uniforms.wobble);
+    \\     
+    \\     out.clip_pos = uniforms.mvp * vec4<f32>(displaced_pos, 1.0);
     \\     out.normal = model.normal;
     \\     out.color = model.color;
-    \\     out.uv = model.uv; // Pass the UVs!
+    \\     out.uv = model.uv;
     \\     return out;
     \\ }
     \\
     \\ @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    \\     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    \\     let light_dir = normalize(uniforms.light_dir);
     \\     let n = normalize(in.normal);
-    \\     let diffuse_light = max(dot(n, light_dir), 0.2); 
     \\     
-    \\     // Sample the image texture at the current UV coordinates
+    \\     // Apply dynamic ambient lighting
+    \\     let diffuse_light = max(dot(n, light_dir), uniforms.ambient); 
+    \\     
     \\     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
-    \\
-    \\     // If the MTL diffuse is pure black, default to pure white!
     \\     let safe_color = max(in.color, vec3<f32>(0.01, 0.01, 0.01)) + step(length(in.color), 0.0) * vec3<f32>(1.0);
     \\     
-    \\     // Multiply Image * Material Color * Lighting!
     \\     let final_color = tex_color.rgb * safe_color * diffuse_light;
     \\     
     \\     return vec4<f32>(final_color, tex_color.a);
@@ -1819,6 +1846,7 @@ const AppState = struct {
     bind_group_layout: c.WGPUBindGroupLayout,
 
     // --- 3D Pipeline Additions ---
+    bind_group_layout_3d: c.WGPUBindGroupLayout,
     pipeline_3d: c.WGPURenderPipeline,
     vbo_3d: c.WGPUBuffer,
     num_3d_verts: u32,
@@ -2156,6 +2184,7 @@ const AppState = struct {
             .font = font,
             .screen_uniform_buf = screen_uniform_buf,
             .bind_group_layout = bind_group_layout,
+            .bind_group_layout_3d = undefined,
             .pipeline_3d = undefined,
             .vbo_3d = undefined,
             .num_3d_verts = 0,
@@ -2191,6 +2220,7 @@ const AppState = struct {
             c.wgpuTextureViewRelease(self.model_tex_view);
             c.wgpuTextureRelease(self.model_tex);
             c.wgpuSamplerRelease(self.model_sampler);
+            c.wgpuBindGroupLayoutRelease(self.bind_group_layout_3d);
         }
 
         c.wgpuQueueRelease(self.queue);
@@ -2401,7 +2431,7 @@ const AppState = struct {
             .nextInChain = null,
             .label = .{ .data = null, .length = 0 },
             .usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst,
-            .size = @sizeOf([16]f32),
+            .size = @sizeOf(UniformData),
             .mappedAtCreation = 0,
         };
         self.mvp_uniform_buf = c.wgpuDeviceCreateBuffer(self.device, &ubo_desc);
@@ -2489,9 +2519,9 @@ const AppState = struct {
 
         // 0: MVP Matrix
         bgl_entries_3d[0].binding = 0;
-        bgl_entries_3d[0].visibility = c.WGPUShaderStage_Vertex;
+        bgl_entries_3d[0].visibility = c.WGPUShaderStage_Vertex | c.WGPUShaderStage_Fragment;
         bgl_entries_3d[0].buffer.type = c.WGPUBufferBindingType_Uniform;
-        bgl_entries_3d[0].buffer.minBindingSize = @sizeOf([16]f32);
+        bgl_entries_3d[0].buffer.minBindingSize = @sizeOf(UniformData);
         // 1: Texture
         bgl_entries_3d[1].binding = 1;
         bgl_entries_3d[1].visibility = c.WGPUShaderStage_Fragment;
@@ -2504,13 +2534,13 @@ const AppState = struct {
 
         const bgl_desc_3d = c.WGPUBindGroupLayoutDescriptor{ .nextInChain = null, .label = .{ .data = null, .length = 0 }, .entryCount = 3, .entries = &bgl_entries_3d };
         const bg_layout_3d = c.wgpuDeviceCreateBindGroupLayout(self.device, &bgl_desc_3d);
-        defer c.wgpuBindGroupLayoutRelease(bg_layout_3d);
+        self.bind_group_layout_3d = bg_layout_3d;
 
         // --- 3. CREATE THE BIND GROUP ---
         var bg_entries_3d = [_]c.WGPUBindGroupEntry{ std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry) };
         bg_entries_3d[0].binding = 0;
         bg_entries_3d[0].buffer = self.mvp_uniform_buf;
-        bg_entries_3d[0].size = @sizeOf([16]f32);
+        bg_entries_3d[0].size = @sizeOf(UniformData);
         bg_entries_3d[1].binding = 1;
         bg_entries_3d[1].textureView = self.model_tex_view;
         bg_entries_3d[2].binding = 2;
@@ -2518,36 +2548,6 @@ const AppState = struct {
 
         const bg_desc_3d = c.WGPUBindGroupDescriptor{ .nextInChain = null, .label = .{ .data = null, .length = 0 }, .layout = bg_layout_3d, .entryCount = 3, .entries = &bg_entries_3d };
         self.bind_group_3d = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc_3d);
-
-        //var bgl_entries_3d = [_]c.WGPUBindGroupLayoutEntry{std.mem.zeroes(c.WGPUBindGroupLayoutEntry)};
-        //bgl_entries_3d[0].binding = 0;
-        //bgl_entries_3d[0].visibility = c.WGPUShaderStage_Vertex;
-        //bgl_entries_3d[0].buffer.type = c.WGPUBufferBindingType_Uniform;
-        //bgl_entries_3d[0].buffer.minBindingSize = @sizeOf([16]f32);
-
-        //const bgl_desc_3d = c.WGPUBindGroupLayoutDescriptor{
-        //    .nextInChain = null,
-        //    .label = .{ .data = null, .length = 0 },
-        //    .entryCount = 1,
-        //    .entries = &bgl_entries_3d,
-        //};
-        //const bg_layout_3d = c.wgpuDeviceCreateBindGroupLayout(self.device, &bgl_desc_3d);
-        //defer c.wgpuBindGroupLayoutRelease(bg_layout_3d);
-
-        //var bg_entries_3d = [_]c.WGPUBindGroupEntry{std.mem.zeroes(c.WGPUBindGroupEntry)};
-        //bg_entries_3d[0].binding = 0;
-        //bg_entries_3d[0].buffer = self.mvp_uniform_buf;
-        //bg_entries_3d[0].offset = 0;
-        //bg_entries_3d[0].size = @sizeOf([16]f32);
-
-        //const bg_desc_3d = c.WGPUBindGroupDescriptor{
-        //    .nextInChain = null,
-        //    .label = .{ .data = null, .length = 0 },
-        //    .layout = bg_layout_3d,
-        //    .entryCount = 1,
-        //    .entries = &bg_entries_3d,
-        //};
-        //self.bind_group_3d = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc_3d);
 
         // 3. Create Offscreen Color Target (400x400)
         const tex_size = 400;
@@ -2679,7 +2679,7 @@ const AppState = struct {
         self.pipeline_3d = c.wgpuDeviceCreateRenderPipeline(self.device, &pipeline_desc);
     }
 
-    pub fn render3DModel(self: *Self, yaw: f32, pitch: f32, zoom: f32) void {
+    pub fn render3DModel(self: *Self, yaw: f32, pitch: f32, zoom: f32, light_x: f32, ambient: f32, wobble: f32, time: f32) void {
         // 1. Calculate MVP Math
         const eye_dist: f32 = zoom;
         const eye_x = @sin(yaw) * @cos(pitch) * eye_dist;
@@ -2688,9 +2688,18 @@ const AppState = struct {
 
         const view = Math3D.lookAt(.{ eye_x, eye_y, eye_z }, .{ 0.0, 0.0, 0.0 }, .{ 0.0, 1.0, 0.0 });
         const proj = Math3D.perspective(std.math.pi / 4.0, 1.0, 0.1, 100.0);
-        const mvp = Math3D.mul(proj, view);
 
-        c.wgpuQueueWriteBuffer(self.queue, self.mvp_uniform_buf, 0, &mvp, @sizeOf([16]f32));
+        const uniform_data = UniformData{
+            .mvp = Math3D.mul(proj, view),
+            .light_dir = .{ light_x, 1.0, 0.5 }, // We'll just slide the X axis for now!
+            .ambient = ambient,
+            .wobble_intensity = wobble,
+            .time = time,
+            .padding = .{ 0.0, 0.0 },
+        };
+        //const mvp = Math3D.mul(proj, view);
+
+        c.wgpuQueueWriteBuffer(self.queue, self.mvp_uniform_buf, 0, &uniform_data, @sizeOf(UniformData));
 
         // 2. Begin Offscreen Pass
         const encoder = c.wgpuDeviceCreateCommandEncoder(self.device, null);
@@ -2738,6 +2747,106 @@ const AppState = struct {
         const cmd_buf = c.wgpuCommandEncoderFinish(encoder, null);
         c.wgpuQueueSubmit(self.queue, 1, &cmd_buf);
         c.wgpuCommandBufferRelease(cmd_buf);
+    }
+
+    pub fn swapModel(self: *Self, allocator: std.mem.Allocator, obj_path: [*c]const u8) !void {
+        // 1. Load the new file into Zig memory
+        const model_data = loadObjFlat(allocator, obj_path) catch |err| {
+            std.debug.print("Failed to load {s}: {}\n", .{ obj_path, err });
+            return;
+        };
+        defer allocator.free(model_data.vertices);
+        defer if (model_data.texture_path) |p| allocator.free(p);
+
+        // 2. Clean up old GPU buffers! (Crucial to prevent memory leaks)
+        c.wgpuBufferRelease(self.vbo_3d);
+        c.wgpuTextureViewRelease(self.model_tex_view);
+        c.wgpuTextureRelease(self.model_tex);
+        c.wgpuSamplerRelease(self.model_sampler);
+        c.wgpuBindGroupRelease(self.bind_group_3d);
+
+        // 3. Create new VBO
+        const vbo_desc = c.WGPUBufferDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUBufferUsage_Vertex | c.WGPUBufferUsage_CopyDst,
+            .size = model_data.vertices.len * @sizeOf(Vertex3D),
+            .mappedAtCreation = 0,
+        };
+        self.vbo_3d = c.wgpuDeviceCreateBuffer(self.device, &vbo_desc);
+        c.wgpuQueueWriteBuffer(self.queue, self.vbo_3d, 0, model_data.vertices.ptr, model_data.vertices.len * @sizeOf(Vertex3D));
+        self.num_3d_verts = @intCast(model_data.vertices.len);
+
+        // 4. Load new Texture
+        var img_w: c_int = 1;
+        var img_h: c_int = 1;
+        var img_channels: c_int = 4;
+        var img_data: [*c]u8 = null;
+        var default_pixel = [_]u8{ 255, 255, 255, 255 };
+
+        if (model_data.texture_path) |path| {
+            const null_term_path = try std.heap.page_allocator.dupeZ(u8, path);
+            defer std.heap.page_allocator.free(null_term_path);
+            img_data = c.stbi_load(null_term_path.ptr, &img_w, &img_h, &img_channels, 4);
+        }
+
+        if (img_data == null) {
+            img_data = &default_pixel;
+            img_w = 1;
+            img_h = 1;
+        }
+
+        const m_tex_desc = c.WGPUTextureDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .usage = c.WGPUTextureUsage_CopyDst | c.WGPUTextureUsage_TextureBinding,
+            .dimension = c.WGPUTextureDimension_2D,
+            .size = .{ .width = @intCast(img_w), .height = @intCast(img_h), .depthOrArrayLayers = 1 },
+            .format = c.WGPUTextureFormat_RGBA8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+            .viewFormatCount = 0,
+            .viewFormats = null,
+        };
+        self.model_tex = c.wgpuDeviceCreateTexture(self.device, &m_tex_desc);
+
+        // (Note: Adjust WGPUTexelCopy... or WGPUTextureCopy... to match whatever compiled for you earlier!)
+        const m_tex_copy = c.WGPUTexelCopyTextureInfo{ .texture = self.model_tex, .mipLevel = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = c.WGPUTextureAspect_All };
+        const m_layout = c.WGPUTexelCopyBufferLayout{ .offset = 0, .bytesPerRow = @intCast(img_w * 4), .rowsPerImage = @intCast(img_h) };
+        c.wgpuQueueWriteTexture(self.queue, &m_tex_copy, img_data, @intCast(img_w * img_h * 4), &m_layout, &m_tex_desc.size);
+
+        if (img_data != @as([*c]u8, @ptrCast(&default_pixel))) c.stbi_image_free(img_data);
+
+        self.model_tex_view = c.wgpuTextureCreateView(self.model_tex, null);
+
+        const m_samp_desc = c.WGPUSamplerDescriptor{
+            .nextInChain = null,
+            .label = .{ .data = null, .length = 0 },
+            .addressModeU = c.WGPUAddressMode_Repeat,
+            .addressModeV = c.WGPUAddressMode_Repeat,
+            .addressModeW = c.WGPUAddressMode_Repeat,
+            .magFilter = c.WGPUFilterMode_Linear,
+            .minFilter = c.WGPUFilterMode_Linear,
+            .mipmapFilter = c.WGPUMipmapFilterMode_Linear,
+            .lodMinClamp = 0.0,
+            .lodMaxClamp = 32.0,
+            .compare = c.WGPUCompareFunction_Undefined,
+            .maxAnisotropy = 1,
+        };
+        self.model_sampler = c.wgpuDeviceCreateSampler(self.device, &m_samp_desc);
+
+        // 5. Create new Bind Group using the saved layout!
+        var bg_entries_3d = [_]c.WGPUBindGroupEntry{ std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry), std.mem.zeroes(c.WGPUBindGroupEntry) };
+        bg_entries_3d[0].binding = 0;
+        bg_entries_3d[0].buffer = self.mvp_uniform_buf;
+        bg_entries_3d[0].size = @sizeOf(UniformData);
+        bg_entries_3d[1].binding = 1;
+        bg_entries_3d[1].textureView = self.model_tex_view;
+        bg_entries_3d[2].binding = 2;
+        bg_entries_3d[2].sampler = self.model_sampler;
+
+        const bg_desc_3d = c.WGPUBindGroupDescriptor{ .nextInChain = null, .label = .{ .data = null, .length = 0 }, .layout = self.bind_group_layout_3d, .entryCount = 3, .entries = &bg_entries_3d };
+        self.bind_group_3d = c.wgpuDeviceCreateBindGroup(self.device, &bg_desc_3d);
     }
 };
 
@@ -2874,14 +2983,69 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     //ui.label("Memory usage: 14MB");
     //ui.endWindow();
 
-    ui.beginWindow("Model Viewer", 100, 100, 400, 400);
+    //ui.beginWindow("Model Viewer", 100, 100, 400, 400);
 
     ui.label("Drag to rotate the model or mousewheel to zoom:");
 
     // The widget displays the render target, and updates our camera variables!
-    ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch, &my_camera_zoom);
+    if (is_3d_ready) {
+        ui.modelViewer("obj_view", app.offscreen_tex, 380, 300, &my_camera_yaw, &my_camera_pitch, &my_camera_zoom);
+    } else {
+        var empty_box = ui.pushBox("empty_viewport", BoxFlags{ .draw_background = true });
+        empty_box.pref_size = .{ .{ .kind = .pixels, .value = 400.0 }, .{ .kind = .pixels, .value = 400.0 } };
+        empty_box.bg_color = .{ 0.02, 0.02, 0.02, 1.0 }; // Very dark grey
 
-    ui.endWindow();
+        ui.label("No model loaded.");
+        ui.label("Select a file from the list below.");
+
+        ui.popBox();
+    }
+    ui.label("Environment Controls:");
+    _ = ui.slider("Sun X Direction", &my_light_x, -2.0, 2.0);
+    _ = ui.slider("Ambient Brightness", &my_ambient, 0.0, 1.0);
+    _ = ui.slider("Wobble Modifier", &my_wobble, 0.0, 0.2);
+    //ui.endWindow();
+
+    ui.label("Load Model:");
+
+    // 1. The Refresh Button
+    if (ui.buttonFullWidth("Scan for New Models", .{})) {
+        refreshModelList(ui.allocator);
+    }
+
+    // 2. The Dynamic List
+    var list_box = ui.pushBox("model_list", BoxFlags{ .scrollable_y = true, .draw_background = true });
+    list_box.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 150.0 } };
+    list_box.bg_color = .{ 0.05, 0.05, 0.05, 1.0 };
+    list_box.padding = 5.0;
+
+    for (available_models.items) |model_path_z| {
+        if (ui.buttonFullWidth(model_path_z, .{})) {
+            if (!is_3d_ready) {
+                // --- FIRST TIME INITIALIZATION ---
+                if (loadObjFlat(ui.allocator, model_path_z.ptr)) |model_data| {
+                    app.init3DPipeline(model_data.vertices, model_data.texture_path) catch |err| {
+                        std.debug.print("Pipeline init failed: {}\n", .{err});
+                    };
+
+                    is_3d_ready = true; // Unlock the viewport!
+
+                    if (model_data.texture_path) |path| ui.allocator.free(path);
+                    ui.allocator.free(model_data.vertices);
+                } else |err| {
+                    std.debug.print("Failed to load {s}: {}\n", .{ model_path_z.ptr, err });
+                }
+            } else {
+                // --- SUBSEQUENT HOT-SWAPS ---
+                app.swapModel(ui.allocator, model_path_z.ptr) catch |err| {
+                    std.debug.print("Swap failed: {}\n", .{err});
+                };
+            }
+
+            my_camera_zoom = 5.0;
+        }
+    }
+    ui.popBox();
 
     ui.popBox();
 
@@ -2902,18 +3066,12 @@ pub fn main() !void {
         std.debug.print("Failed to load test.png! Error: {}\n", .{err});
     }
 
-    if (loadObjFlat(gpa.allocator(), "test_model.obj")) |model_data| {
-        try app.init3DPipeline(model_data.vertices, model_data.texture_path);
-        is_3d_ready = true;
-
-        if (model_data.texture_path) |path| {
-            gpa.allocator().free(path);
-        }
-
-        gpa.allocator().free(model_data.vertices); // Free it for now!
-    } else |err| {
-        std.debug.print("Failed to load or init 3D model! Error: {}\n", .{err});
+    available_models = std.ArrayList([:0]const u8){};
+    defer {
+        for (available_models.items) |item| gpa.allocator().free(item);
+        available_models.deinit(gpa.allocator());
     }
+    refreshModelList(gpa.allocator());
 
     var window_width: u32 = 800;
     var window_height: u32 = 600;
@@ -3065,7 +3223,8 @@ pub fn main() !void {
         if (!running) break;
 
         if (is_3d_ready) {
-            app.render3DModel(my_camera_yaw, my_camera_pitch, my_camera_zoom);
+            total_time += dt;
+            app.render3DModel(my_camera_yaw, my_camera_pitch, my_camera_zoom, my_light_x, my_ambient, my_wobble, total_time);
         }
 
         renderAppFrame(&app, &ui, current_input, dt, window_width, window_height);
@@ -3260,4 +3419,25 @@ pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) !ModelD
     }
 
     return ModelData{ .vertices = try vertices.toOwnedSlice(allocator), .texture_path = found_tex_path };
+}
+
+pub fn refreshModelList(allocator: std.mem.Allocator) void {
+    // Clear out the old list if we are refreshing
+    for (available_models.items) |item| allocator.free(item);
+    available_models.clearRetainingCapacity();
+
+    // Open the current working directory as an iterable
+    var dir = std.fs.cwd().openDir(".", .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        // Is it a file, and does it end with .obj?
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".obj")) {
+            // Duplicate the string as a null-terminated Z-string for C-interop!
+            if (allocator.dupeZ(u8, entry.name)) |name_z| {
+                available_models.append(allocator, name_z) catch {};
+            } else |_| {}
+        }
+    }
 }
