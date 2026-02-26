@@ -35,6 +35,7 @@ var my_ambient: f32 = 0.2;
 var my_wobble: f32 = 0.0;
 var total_time: f32 = 0.0;
 var available_models: std.ArrayList([:0]const u8) = undefined;
+var my_ui_tint = [4]f32{ 0.96, 0.64, 0.11, 1.0 }; // Zig Orange!
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -1665,6 +1666,25 @@ pub const UI = struct {
 
         self.popBox();
     }
+
+    pub fn colorPicker(self: *UI, _label: []const u8, color: *[4]f32) void {
+        self.label(_label);
+
+        // 1. The Color Swatch (A simple box with its background set to the current color!)
+        var swatch = self.pushBox(_label, BoxFlags{ .draw_background = true });
+        swatch.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 24.0 } };
+        swatch.bg_color = color.*; // Dereference the pointer to read the current array values
+        swatch.corner_radius = 4.0;
+        self.popBox();
+
+        // 2. The Sliders
+        // (Note: In a massive application, you would concatenate the label string with
+        // "Red", "Green", etc., to prevent ID hash collisions between multiple color pickers)
+        _ = self.slider("Red", &color[0], 0.0, 1.0);
+        _ = self.slider("Green", &color[1], 0.0, 1.0);
+        _ = self.slider("Blue", &color[2], 0.0, 1.0);
+        _ = self.slider("Alpha", &color[3], 0.0, 1.0);
+    }
 };
 
 // ==========================================
@@ -1894,7 +1914,7 @@ const AppState = struct {
         c.wgpuQueueWriteBuffer(queue, screen_uniform_buf, 0, &initial_screen, @sizeOf([2]f32));
 
         // 1. Bake the Font
-        const ttf_file = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "font.otf", 1024 * 1024 * 10);
+        const ttf_file = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "assets/font.otf", 1024 * 1024 * 10);
         defer std.heap.page_allocator.free(ttf_file);
 
         var font: Font = undefined;
@@ -2893,6 +2913,18 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     main_panel.padding = 20.0;
     main_panel.gap = 10.0;
 
+    var header_box = ui.pushBox("header_panel", BoxFlags{ .draw_background = true });
+    header_box.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 60.0 } };
+    header_box.bg_color = my_ui_tint; // Bind the background to our dynamic color!
+    header_box.corner_radius = 8.0;
+    header_box.padding = 10.0;
+
+    ui.label("Zig WebGPU Engine v1.0"); // This text will sit inside the colored header
+    ui.popBox();
+
+    ui.label("Theme Settings:");
+    ui.colorPicker("Window Accent Color", &my_ui_tint);
+
     ui.label("This GUI supports [#FF0000]Colors[/], [#55FF55]Multiple [#5555FF]Tags[/], and [b]Faux Bold Text[/] inline!");
 
     var counter_buf: [32]u8 = undefined;
@@ -3059,7 +3091,7 @@ pub fn main() !void {
     var app = try AppState.init();
     defer app.deinit();
 
-    if (app.loadTexture("test.png")) |tex| {
+    if (app.loadTexture("assets/test.png")) |tex| {
         my_image = tex;
         image_loaded = true;
     } else |err| {
@@ -3285,20 +3317,19 @@ fn requestDeviceCallback(status: c.WGPURequestDeviceStatus, device: c.WGPUDevice
 
 const FileContext = struct {
     allocator: std.mem.Allocator,
-    file_buffer: ?[]u8,
+    file_buffers: std.ArrayList([]u8),
 };
 
 // C-ABI compatible callback for tinyobj_loader
 fn tinyObjFileReader(ctx_ptr: ?*anyopaque, filename: [*c]const u8, is_mtl: c_int, obj_filename: [*c]const u8, out_buf: [*c][*c]u8, out_len: [*c]usize) callconv(.c) void {
-    _ = is_mtl;
     _ = obj_filename;
-
+    _ = is_mtl;
     var ctx: *FileContext = @ptrCast(@alignCast(ctx_ptr));
-    const path = std.mem.span(filename);
 
-    // Read the file into Zig memory
-    if (std.fs.cwd().readFileAlloc(ctx.allocator, path, 1024 * 1024 * 50)) |file_data| {
-        ctx.file_buffer = file_data;
+    const path_requested = std.mem.span(filename);
+
+    if (std.fs.cwd().readFileAlloc(ctx.allocator, path_requested, 1024 * 1024 * 50)) |file_data| {
+        ctx.file_buffers.append(ctx.allocator, file_data) catch {};
         out_buf.* = file_data.ptr;
         out_len.* = file_data.len;
     } else |_| {
@@ -3316,7 +3347,7 @@ pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) !ModelD
 
     var ctx = FileContext{
         .allocator = allocator,
-        .file_buffer = null,
+        .file_buffers = std.ArrayList([]u8){},
     };
 
     // Force the loader to convert quads/n-gons into triangles!
@@ -3335,7 +3366,10 @@ pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) !ModelD
     );
 
     // Free the raw text buffer we allocated in the callback
-    defer if (ctx.file_buffer) |buf| allocator.free(buf);
+    defer {
+        for (ctx.file_buffers.items) |buf| allocator.free(buf);
+        ctx.file_buffers.deinit(ctx.allocator);
+    }
 
     if (ret != c.TINYOBJ_SUCCESS) {
         return error.ObjParseFailed;
@@ -3348,13 +3382,18 @@ pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) !ModelD
     if (materials != null and num_materials > 0) {
         for (0..num_materials) |m_i| {
             if (materials[m_i].diffuse_texname != null) {
-                // Convert the raw C-pointer to a Zig slice
-                const tex_c_str = materials[m_i].diffuse_texname;
-                const tex_slice = std.mem.span(tex_c_str);
+                const tex_slice = std.mem.span(materials[m_i].diffuse_texname);
+                const obj_path_slice = std.mem.span(filepath);
 
-                // Duplicate it into our Zig allocator so it survives the C-memory cleanup!
-                found_tex_path = allocator.dupe(u8, tex_slice) catch null;
-                break; // Stop after finding the first texture
+                // --- JOIN THE DIRECTORY WITH THE TEXTURE NAME ---
+                if (std.fs.path.dirname(obj_path_slice)) |dir| {
+                    found_tex_path = std.fs.path.join(allocator, &[_][]const u8{ dir, tex_slice }) catch null;
+                } else {
+                    found_tex_path = allocator.dupe(u8, tex_slice) catch null;
+                }
+                // ------------------------------------------------
+
+                break;
             }
         }
     }
@@ -3427,7 +3466,7 @@ pub fn refreshModelList(allocator: std.mem.Allocator) void {
     available_models.clearRetainingCapacity();
 
     // Open the current working directory as an iterable
-    var dir = std.fs.cwd().openDir(".", .{ .iterate = true }) catch return;
+    var dir = std.fs.cwd().openDir("assets", .{ .iterate = true }) catch return;
     defer dir.close();
 
     var it = dir.iterate();
@@ -3435,8 +3474,8 @@ pub fn refreshModelList(allocator: std.mem.Allocator) void {
         // Is it a file, and does it end with .obj?
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".obj")) {
             // Duplicate the string as a null-terminated Z-string for C-interop!
-            if (allocator.dupeZ(u8, entry.name)) |name_z| {
-                available_models.append(allocator, name_z) catch {};
+            if (std.fs.path.joinZ(allocator, &[_][]const u8{ "assets", entry.name })) |full_path| {
+                available_models.append(allocator, full_path) catch {};
             } else |_| {}
         }
     }
