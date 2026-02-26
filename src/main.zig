@@ -35,7 +35,10 @@ var my_ambient: f32 = 0.2;
 var my_wobble: f32 = 0.0;
 var total_time: f32 = 0.0;
 var available_models: std.ArrayList([:0]const u8) = undefined;
-var my_ui_tint = [4]f32{ 0.96, 0.64, 0.11, 1.0 }; // Zig Orange!
+var my_ui_tint = [4]f32{ 1.0, 0.25, 0.25, 1.0 };
+var frame_count: u32 = 0;
+var fps_timer: f32 = 0.0;
+var current_fps: f32 = 0.0;
 
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
@@ -2914,12 +2917,21 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     main_panel.gap = 10.0;
 
     var header_box = ui.pushBox("header_panel", BoxFlags{ .draw_background = true });
-    header_box.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 60.0 } };
+    header_box.pref_size = .{ .{ .kind = .percent_of_parent, .value = 100.0 }, .{ .kind = .pixels, .value = 80.0 } };
     header_box.bg_color = my_ui_tint; // Bind the background to our dynamic color!
     header_box.corner_radius = 8.0;
     header_box.padding = 10.0;
 
     ui.label("Zig WebGPU Engine v1.0"); // This text will sit inside the colored header
+
+    // --- FORMAT AND DRAW THE FPS ---
+    // Create a tiny 32-byte temporary buffer on the stack
+    var fps_buf: [32]u8 = undefined;
+    // Format the string, restricting the float to 1 decimal place ({d:.1})
+    if (std.fmt.bufPrint(&fps_buf, "FPS: {d:.1}", .{current_fps})) |fps_str| {
+        ui.label(fps_str);
+    } else |_| {}
+
     ui.popBox();
 
     ui.label("Theme Settings:");
@@ -2937,18 +2949,18 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     }
 
     // --- INVISIBLE SPACER ---
-    var spacer = ui.pushBox("Spacer1", BoxFlags{});
-    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
-    ui.popBox();
+    //var spacer = ui.pushBox("Spacer1", BoxFlags{});
+    //spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    //ui.popBox();
 
     // --- BUTTON 2 ---
     if (ui.button("Decrement", .{})) {
         counter -= 1;
     }
 
-    spacer = ui.pushBox("Spacer2", BoxFlags{});
-    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
-    ui.popBox();
+    //spacer = ui.pushBox("Spacer2", BoxFlags{});
+    //spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    //ui.popBox();
 
     ui.label("Settings");
 
@@ -2957,9 +2969,9 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     _ = ui.checkbox("Show Debug Stats", &show_debug);
 
     // Spacer
-    spacer = ui.pushBox("Spacer3", BoxFlags{});
-    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
-    ui.popBox();
+    //spacer = ui.pushBox("Spacer3", BoxFlags{});
+    //spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    //ui.popBox();
 
     // Radio Buttons
     ui.label("Graphics Quality:");
@@ -2967,18 +2979,18 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
     _ = ui.radioButton("Medium", &graphics_quality, 1);
     _ = ui.radioButton("Ultra", &graphics_quality, 2);
 
-    spacer = ui.pushBox("Spacer4", BoxFlags{});
-    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
-    ui.popBox();
+    //spacer = ui.pushBox("Spacer4", BoxFlags{});
+    //spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    //ui.popBox();
 
     ui.label("Audio");
 
     // The Slider!
     _ = ui.slider("Master Volume", &master_volume, 0.0, 1.0);
 
-    spacer = ui.pushBox("Spacer5", BoxFlags{});
-    spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
-    ui.popBox();
+    //spacer = ui.pushBox("Spacer5", BoxFlags{});
+    //spacer.pref_size = .{ .{ .kind = .pixels, .value = 10.0 }, .{ .kind = .pixels, .value = 20.0 } };
+    //ui.popBox();
 
     ui.label("Name:");
     _ = (ui.textInput("name_input", &my_text_buf, &my_text_len));
@@ -3112,8 +3124,6 @@ pub fn main() !void {
     var ui = try UI.init(gpa.allocator());
     defer ui.deinit();
 
-    const dt: f32 = 0.008; // Simulate 60fps for example
-
     // Create a persistent input state outside the loop
     var current_input = InputState{};
     var running = true;
@@ -3129,7 +3139,24 @@ pub fn main() !void {
     c.RGFW_window_setUserPtr(app.window, &ctx);
     _ = c.RGFW_setWindowResizedCallback(onWindowResize);
 
+    var timer = try std.time.Timer.start();
     while (running and c.RGFW_window_shouldClose(app.window) == 0) {
+        const elapsed_ns = timer.lap();
+
+        // Convert nanoseconds to seconds (1 billion ns = 1 second)
+        const dt = @as(f32, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+        // -------------------------
+
+        // --- FPS SMOOTHING CALCULATION ---
+        frame_count += 1;
+        fps_timer += dt;
+
+        if (fps_timer >= 0.5) {
+            current_fps = @as(f32, @floatFromInt(frame_count)) / fps_timer;
+            frame_count = 0;
+            fps_timer = 0.0;
+        }
+
         // 1. Reset 1-frame input triggers at the start of every frame
         current_input.mouse_left_pressed = false;
         current_input.mouse_left_released = false;
