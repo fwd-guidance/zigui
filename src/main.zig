@@ -1090,36 +1090,6 @@ pub const UI = struct {
             }
         }
 
-        //var text_width: f32 = 0.0;
-        //if (node.text.len > 0) {
-        //    var dummy_y: f32 = 0.0;
-        //    var j: usize = 0;
-        //    while (j < node.text.len) {
-        //        // Check for markup tags and SKIP them!
-        //        if (node.text[j] == '[' and j + 1 < node.text.len) {
-        //            if (std.mem.startsWith(u8, node.text[j..], "[/]")) {
-        //                j += 3;
-        //                continue;
-        //            }
-        //            if (std.mem.startsWith(u8, node.text[j..], "[b]")) {
-        //                j += 3;
-        //                continue;
-        //            }
-        //            if (node.text.len >= j + 9 and node.text[j + 1] == '#' and node.text[j + 8] == ']') {
-        //                j += 9;
-        //                continue;
-        //            }
-        //        }
-
-        //        const char = node.text[j];
-        //        if (char >= 32 and char < 128) {
-        //            var q: c.stbtt_aligned_quad = undefined;
-        //            c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &text_width, &dummy_y, &q, 1);
-        //        }
-        //        j += 1;
-        //    }
-        //}
-
         // 2. Establish our baseline coordinates
         var start_x: f32 = node.rect.pos[0];
         switch (node.text_align) {
@@ -1220,92 +1190,6 @@ pub const UI = struct {
                     cursor_x += glyph.xadvance * scale;
                 }
                 i += 1;
-
-                //const char = node.text[i];
-                //if (self.font_map.get(char)) |glyph| {
-                //    if (glyph.planeBounds != null and glyph.atlasBounds != null) {
-                //        const pb = glyph.planeBounds.?;
-                //        const ab = glyph.atlasBounds.?;
-
-                //        // MSDF plane Y points UP, but screen Y points DOWN!
-                //        const q_x = cursor_x + (pb.left * font_scale);
-                //        const q_y = cursor_y - (pb.top * font_scale);
-                //        const q_w = (pb.right - pb.left) * font_scale;
-                //        const q_h = (pb.top - pb.bottom) * font_scale;
-
-                //        // Image mapping in WGPU starts from top-left
-                //        const atlas_w: f32 = 512.0;
-                //        const atlas_h: f32 = 512.0;
-                //        const u_min = ab.left / atlas_w;
-                //        const u_max = ab.right / atlas_w;
-                //        const v_min = 1.0 - (ab.top / atlas_h);
-                //        const v_max = 1.0 - (ab.bottom / atlas_h);
-
-                //        // 1. Draw Normal Character
-                //        instances.append(self.allocator, InstanceData{
-                //            .rect_pos = .{ q_x, q_y },
-                //            .rect_size = .{ q_w, q_h },
-                //            .color = current_color,
-                //            .clip_rect = node.clip_rect,
-                //            .corner_radius = 0.0,
-                //            .edge_softness = 0.0,
-                //            .type_flag = 4, // MSDF Shader Branch!
-                //            .uv_min = .{ u_min, v_min },
-                //            .uv_max = .{ u_max, v_max },
-                //        }) catch unreachable;
-
-                //        // 2. Faux Bold
-                //        if (is_bold) {
-                //            instances.append(self.allocator, InstanceData{
-                //                .rect_pos = .{ q_x + 1.0, q_y }, // +1.0 X offset!
-                //                .rect_size = .{ q_w, q_h },
-                //                .color = current_color,
-                //                .clip_rect = node.clip_rect,
-                //                .corner_radius = 0.0,
-                //                .edge_softness = 0.0,
-                //                .type_flag = 4,
-                //                .uv_min = .{ u_min, v_min },
-                //                .uv_max = .{ u_max, v_max },
-                //            }) catch unreachable;
-                //        }
-                //    }
-                //    cursor_x += glyph.advance * font_scale;
-                //}
-
-                //const char = node.text[i];
-                //if (char >= 32 and char < 128) {
-                //    var q: c.stbtt_aligned_quad = undefined;
-                //    c.stbtt_GetBakedQuad(&font.cdata, 512, 512, @intCast(char - 32), &cursor_x, &cursor_y, &q, 1);
-
-                //    // 1. Draw Normal Character
-                //    instances.append(self.allocator, InstanceData{
-                //        .rect_pos = .{ q.x0, q.y0 },
-                //        .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
-                //        .color = current_color, // Apply dynamic color!
-                //        .clip_rect = node.clip_rect,
-                //        .corner_radius = 0.0,
-                //        .edge_softness = 0.0,
-                //        .type_flag = 1,
-                //        .uv_min = .{ q.s0, q.t0 },
-                //        .uv_max = .{ q.s1, q.t1 },
-                //    }) catch unreachable;
-
-                //    // 2. Faux Bold (Draw a second time, shifted right by 1 pixel)
-                //    if (is_bold) {
-                //        instances.append(self.allocator, InstanceData{
-                //            .rect_pos = .{ q.x0 + 1.0, q.y0 }, // +1.0 X offset!
-                //            .rect_size = .{ q.x1 - q.x0, q.y1 - q.y0 },
-                //            .color = current_color,
-                //            .clip_rect = node.clip_rect,
-                //            .corner_radius = 0.0,
-                //            .edge_softness = 0.0,
-                //            .type_flag = 1,
-                //            .uv_min = .{ q.s0, q.t0 },
-                //            .uv_max = .{ q.s1, q.t1 },
-                //        }) catch unreachable;
-                //    }
-                //}
-                //i += 1;
             }
         }
 
@@ -1362,74 +1246,6 @@ pub const UI = struct {
         self.popBox();
         return self.active_hash == box.hash and self.input.mouse_left_released and self.hot_hash_this_frame == box.hash;
     }
-
-    //pub fn label(self: *UI, text: []const u8) void {
-    //    const node = self.getCurrentNode();
-
-    //    // This is your desired font size in screen pixels
-    //    const font_scale: f32 = 24.0;
-
-    //    // The exact dimensions of the PNG you generated!
-    //    const atlas_w: f32 = 512.0;
-    //    const atlas_h: f32 = 512.0;
-
-    //    // We start drawing from the top-left of the UI box, but fonts draw from a baseline.
-    //    // We push the starting Y down so the letters don't render outside the top of the box!
-    //    var cursor_x: f32 = node.rect.pos[0];
-    //    var cursor_y: f32 = node.rect.pos[1] + font_scale;
-
-    //    for (text) |char| {
-    //        // Handle simple newlines
-    //        if (char == '\n') {
-    //            cursor_x = node.rect.pos[0];
-    //            cursor_y += font_scale * 1.2; // 1.2 is a standard line-height multiplier
-    //            continue;
-    //        }
-
-    //        if (self.font_map.get(char)) |glyph| {
-    //            // Some characters (like spaces) don't have physical geometry to draw!
-    //            if (glyph.planeBounds != null and glyph.atlasBounds != null) {
-    //                const pb = glyph.planeBounds.?;
-    //                const ab = glyph.atlasBounds.?;
-
-    //                // --- 1. CALCULATE SCREEN RECTANGLE ---
-    //                // pb.left/right/top/bottom are normalized values (usually around -0.2 to +1.0).
-    //                // We multiply them by our desired font_scale to get actual screen pixels.
-    //                // Note: We subtract pb.top from cursor_y because MSDF plane Y points UP, but our screen Y points DOWN!
-    //                const q_x = cursor_x + (pb.left * font_scale);
-    //                const q_y = cursor_y - (pb.top * font_scale);
-    //                const q_w = (pb.right - pb.left) * font_scale;
-    //                const q_h = (pb.top - pb.bottom) * font_scale;
-
-    //                // --- 2. CALCULATE WEBGPU UVs ---
-    //                // Convert the pixel coordinates from the JSON into 0.0 -> 1.0 space
-    //                // We invert the Y coordinates because image mapping in WGPU starts from the top-left!
-    //                const u_min = ab.left / atlas_w;
-    //                const u_max = ab.right / atlas_w;
-    //                const v_min = 1.0 - (ab.top / atlas_h);
-    //                const v_max = 1.0 - (ab.bottom / atlas_h);
-
-    //                // --- 3. PUSH TO THE GPU BUFFER ---
-    //                self.commands.append(self.allocator, InstanceData{
-    //                    .rect_pos = .{ q_x, q_y },
-    //                    .rect_size = .{ q_w, q_h },
-    //                    .color = node.color, // Inherit color from the UI block
-    //                    .clip_rect = node.clip_rect,
-    //                    .corner_radius = 0.0,
-    //                    .edge_softness = 0.0,
-
-    //                    .type_flag = 4, // Your new MSDF shader branch!
-
-    //                    .uv_min = .{ u_min, v_min },
-    //                    .uv_max = .{ u_max, v_max },
-    //                }) catch unreachable;
-    //            }
-
-    //            // Move the cursor forward for the next letter
-    //            cursor_x += glyph.advance * font_scale;
-    //        }
-    //    }
-    //}
 
     pub fn label(self: *UI, text: []const u8) void {
         var box = self.pushBox(text, BoxFlags{}); // No background, not clickable
@@ -2235,69 +2051,6 @@ const AppState = struct {
             .maxAnisotropy = 1,
         };
         font.sampler = c.wgpuDeviceCreateSampler(device, &sampler_desc);
-
-        //// 1. Bake the Font
-        //const ttf_file = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, "assets/font.otf", 1024 * 1024 * 10);
-        //defer std.heap.page_allocator.free(ttf_file);
-
-        //var font: Font = undefined;
-        //var temp_bitmap: [512 * 512]u8 = undefined;
-        //_ = c.stbtt_BakeFontBitmap(ttf_file.ptr, 0, 32.0, // 32.0 is the pixel height
-        //    &temp_bitmap, 512, 512, 32, 96, &font.cdata);
-
-        //// 2. Create WGPU Texture
-        //const tex_desc = c.WGPUTextureDescriptor{
-        //    .nextInChain = null,
-        //    .label = empty_label,
-        //    .usage = c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst,
-        //    .dimension = c.WGPUTextureDimension_2D,
-        //    .size = .{ .width = 512, .height = 512, .depthOrArrayLayers = 1 },
-        //    .format = c.WGPUTextureFormat_R8Unorm, // Single channel alpha!
-        //    .mipLevelCount = 1,
-        //    .sampleCount = 1,
-        //    .viewFormatCount = 0,
-        //    .viewFormats = null,
-        //};
-        //font.texture = c.wgpuDeviceCreateTexture(device, &tex_desc);
-
-        //// Upload the bitmap bytes
-        //const image_copy = c.WGPUTexelCopyTextureInfo{
-        //    //.nextInChain = null,
-        //    .texture = font.texture,
-        //    .mipLevel = 0,
-        //    .origin = .{ .x = 0, .y = 0, .z = 0 },
-        //    .aspect = c.WGPUTextureAspect_All,
-        //};
-        //const layout = c.WGPUTexelCopyBufferLayout{
-        //    //.nextInChain = null,
-        //    .offset = 0,
-        //    .bytesPerRow = 512,
-        //    .rowsPerImage = 512,
-        //};
-        //const copy_size = c.WGPUExtent3D{ .width = 512, .height = 512, .depthOrArrayLayers = 1 };
-        //c.wgpuQueueWriteTexture(queue, &image_copy, &temp_bitmap, temp_bitmap.len, &layout, &copy_size);
-
-        //const tex_view = c.wgpuTextureCreateView(font.texture, null);
-        //defer c.wgpuTextureViewRelease(tex_view);
-
-        //// 3. Create Sampler
-        //const sampler_desc = c.WGPUSamplerDescriptor{
-        //    .nextInChain = null,
-        //    .label = empty_label,
-        //    .addressModeU = c.WGPUAddressMode_ClampToEdge,
-        //    .addressModeV = c.WGPUAddressMode_ClampToEdge,
-        //    .addressModeW = c.WGPUAddressMode_ClampToEdge,
-        //    .magFilter = c.WGPUFilterMode_Linear,
-        //    .minFilter = c.WGPUFilterMode_Linear,
-        //    .mipmapFilter = c.WGPUMipmapFilterMode_Linear,
-        //    .lodMinClamp = 0.0,
-        //    .lodMaxClamp = 32.0,
-        //    .compare = c.WGPUCompareFunction_Undefined,
-        //    .maxAnisotropy = 1,
-        //    // ... leave remaining as 0 / default
-        //};
-        //const font_sampler = c.wgpuDeviceCreateSampler(device, &sampler_desc);
-        //defer c.wgpuSamplerRelease(font_sampler);
 
         // --- 4. Define the Bind Group Layout (The "Contract") ---
         var bgl_entries = [_]c.WGPUBindGroupLayoutEntry{
