@@ -6,7 +6,6 @@ const c = @cImport({
     @cInclude("RGFW.h");
     @cInclude("webgpu/webgpu.h");
     @cInclude("stb_image.h");
-    @cInclude("tinyobj_loader_c.h");
 });
 
 // ==========================================
@@ -62,30 +61,43 @@ const BMFont = struct {
     chars: []BMFontChar,
 };
 
-const MSDFBounds = struct { left: f32, bottom: f32, right: f32, top: f32 };
-
-const MSDFGlyph = struct {
-    unicode: u32,
-    advance: f32,
-    planeBounds: ?MSDFBounds = null,
-    atlasBounds: ?MSDFBounds = null,
-};
-
-const MSDFMetrics = struct {
-    emSize: f32,
-    lineHeight: f32,
-    ascender: f32,
-    descender: f32,
-};
-
-const MSDFFont = struct {
-    metrics: MSDFMetrics,
-    glyphs: []MSDFGlyph,
-};
-
 pub const Rect = struct {
     pos: [2]f32 = .{ 0.0, 0.0 },
     size: [2]f32 = .{ 0.0, 0.0 },
+};
+
+pub const ObjVertexIndex = struct {
+    v_idx: i32 = -1,
+    vt_idx: i32 = -1,
+    vn_idx: i32 = -1,
+};
+
+pub const ObjMaterial = struct {
+    name: []const u8 = "",
+    diffuse: [3]f32 = .{ 0.8, 0.8, 0.8 },
+    diffuse_texname: ?[]const u8 = null,
+};
+
+pub const ObjResult = struct {
+    vertices: []f32,
+    normals: []f32,
+    texcoords: []f32,
+    faces: []ObjVertexIndex,
+    material_ids: []i32,
+    materials: []ObjMaterial,
+
+    pub fn deinit(self: *ObjResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.vertices);
+        allocator.free(self.normals);
+        allocator.free(self.texcoords);
+        allocator.free(self.faces);
+        allocator.free(self.material_ids);
+        for (self.materials) |m| {
+            allocator.free(m.name);
+            if (m.diffuse_texname) |tex| allocator.free(tex);
+        }
+        allocator.free(self.materials);
+    }
 };
 
 pub const Vertex3D = extern struct {
@@ -2848,7 +2860,7 @@ const AppState = struct {
         c.wgpuCommandBufferRelease(cmd_buf);
     }
 
-    pub fn swapModel(self: *Self, allocator: std.mem.Allocator, obj_path: [*c]const u8) !void {
+    pub fn swapModel(self: *Self, allocator: std.mem.Allocator, obj_path: []const u8) !void {
         // 1. Load the new file into Zig memory
         const model_data = loadObjFlat(allocator, obj_path) catch |err| {
             std.debug.print("Failed to load {s}: {}\n", .{ obj_path, err });
@@ -3143,7 +3155,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
         if (ui.buttonFullWidth(model_path_z, .{})) {
             if (!is_3d_ready) {
                 // --- FIRST TIME INITIALIZATION ---
-                if (loadObjFlat(ui.allocator, model_path_z.ptr)) |model_data| {
+                if (loadObjFlat(ui.allocator, model_path_z)) |model_data| {
                     app.init3DPipeline(model_data.vertices, model_data.texture_path) catch |err| {
                         std.debug.print("Pipeline init failed: {}\n", .{err});
                     };
@@ -3157,7 +3169,7 @@ fn renderAppFrame(app: *AppState, ui: *UI, input: InputState, dt: f32, window_wi
                 }
             } else {
                 // --- SUBSEQUENT HOT-SWAPS ---
-                app.swapModel(ui.allocator, model_path_z.ptr) catch |err| {
+                app.swapModel(ui.allocator, model_path_z) catch |err| {
                     std.debug.print("Swap failed: {}\n", .{err});
                 };
             }
@@ -3443,120 +3455,192 @@ fn tinyObjFileReader(ctx_ptr: ?*anyopaque, filename: [*c]const u8, is_mtl: c_int
     }
 }
 
-pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: [*c]const u8) !ModelData {
-    var attrib: c.tinyobj_attrib_t = undefined;
-    var shapes: [*c]c.tinyobj_shape_t = null;
-    var num_shapes: usize = 0;
-    var materials: [*c]c.tinyobj_material_t = null;
-    var num_materials: usize = 0;
+fn parseFaceVertex(token: []const u8, num_v: usize, num_vt: usize, num_vn: usize) ObjVertexIndex {
+    var vi = ObjVertexIndex{};
+    var it = std.mem.splitScalar(u8, token, '/');
 
-    var ctx = FileContext{
-        .allocator = allocator,
-        .file_buffers = std.ArrayList([]u8){},
+    if (it.next()) |v_str| if (v_str.len > 0) {
+        const v = std.fmt.parseInt(i32, v_str, 10) catch 1;
+        vi.v_idx = if (v < 0) @as(i32, @intCast(num_v)) + v else v - 1;
     };
+    if (it.next()) |vt_str| if (vt_str.len > 0) {
+        const vt = std.fmt.parseInt(i32, vt_str, 10) catch 1;
+        vi.vt_idx = if (vt < 0) @as(i32, @intCast(num_vt)) + vt else vt - 1;
+    };
+    if (it.next()) |vn_str| if (vn_str.len > 0) {
+        const vn = std.fmt.parseInt(i32, vn_str, 10) catch 1;
+        vi.vn_idx = if (vn < 0) @as(i32, @intCast(num_vn)) + vn else vn - 1;
+    };
+    return vi;
+}
 
-    // Force the loader to convert quads/n-gons into triangles!
-    const flags = c.TINYOBJ_FLAG_TRIANGULATE;
+fn parseMtl(allocator: std.mem.Allocator, mtl_path: []const u8, materials: *std.ArrayList(ObjMaterial)) !void {
+    const file_data = std.fs.cwd().readFileAlloc(allocator, mtl_path, 1024 * 1024 * 10) catch return;
+    defer allocator.free(file_data);
 
-    const ret = c.tinyobj_parse_obj(
-        &attrib,
-        &shapes,
-        &num_shapes,
-        &materials,
-        &num_materials,
-        filepath,
-        tinyObjFileReader,
-        &ctx,
-        flags,
-    );
+    var current_mat: ?*ObjMaterial = null;
+    var it = std.mem.splitScalar(u8, file_data, '\n');
 
-    // Free the raw text buffer we allocated in the callback
-    defer {
-        for (ctx.file_buffers.items) |buf| allocator.free(buf);
-        ctx.file_buffers.deinit(ctx.allocator);
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var tokens = std.mem.tokenizeAny(u8, line, " \t");
+        const prefix = tokens.next() orelse continue;
+
+        if (std.mem.eql(u8, prefix, "newmtl")) {
+            try materials.append(allocator, .{ .name = try allocator.dupe(u8, tokens.rest()) });
+            current_mat = &materials.items[materials.items.len - 1];
+        } else if (std.mem.eql(u8, prefix, "Kd") and current_mat != null) {
+            const r = std.fmt.parseFloat(f32, tokens.next() orelse "0.8") catch 0.8;
+            const g = std.fmt.parseFloat(f32, tokens.next() orelse "0.8") catch 0.8;
+            const b = std.fmt.parseFloat(f32, tokens.next() orelse "0.8") catch 0.8;
+            current_mat.?.diffuse = .{ r, g, b };
+        } else if (std.mem.eql(u8, prefix, "map_Kd") and current_mat != null) {
+            current_mat.?.diffuse_texname = try allocator.dupe(u8, tokens.rest());
+        }
+    }
+}
+
+pub fn parseObj(allocator: std.mem.Allocator, obj_path: []const u8) !ObjResult {
+    const file_data = try std.fs.cwd().readFileAlloc(allocator, obj_path, 1024 * 1024 * 50);
+    defer allocator.free(file_data);
+
+    var vertices = std.ArrayList(f32){};
+    var normals = std.ArrayList(f32){};
+    var texcoords = std.ArrayList(f32){};
+    var faces = std.ArrayList(ObjVertexIndex){};
+    var material_ids = std.ArrayList(i32){};
+    var materials = std.ArrayList(ObjMaterial){};
+
+    var current_mat_id: i32 = -1;
+    var it = std.mem.splitScalar(u8, file_data, '\n');
+
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var tokens = std.mem.tokenizeAny(u8, line, " \t");
+        const prefix = tokens.next() orelse continue;
+
+        if (std.mem.eql(u8, prefix, "v")) {
+            for (0..3) |_| try vertices.append(allocator, std.fmt.parseFloat(f32, tokens.next() orelse "0") catch 0);
+        } else if (std.mem.eql(u8, prefix, "vn")) {
+            for (0..3) |_| try normals.append(allocator, std.fmt.parseFloat(f32, tokens.next() orelse "0") catch 0);
+        } else if (std.mem.eql(u8, prefix, "vt")) {
+            for (0..2) |_| try texcoords.append(allocator, std.fmt.parseFloat(f32, tokens.next() orelse "0") catch 0);
+        } else if (std.mem.eql(u8, prefix, "f")) {
+            var face_verts = std.ArrayList(ObjVertexIndex){};
+            defer face_verts.deinit(allocator);
+            while (tokens.next()) |token| {
+                try face_verts.append(allocator, parseFaceVertex(token, vertices.items.len / 3, texcoords.items.len / 2, normals.items.len / 3));
+            }
+            // Triangulate n-gons
+            if (face_verts.items.len >= 3) {
+                var i: usize = 1;
+                while (i < face_verts.items.len - 1) : (i += 1) {
+                    try faces.append(allocator, face_verts.items[0]);
+                    try faces.append(allocator, face_verts.items[i]);
+                    try faces.append(allocator, face_verts.items[i + 1]);
+                    try material_ids.append(allocator, current_mat_id); // 1 material per triangle
+                }
+            }
+        } else if (std.mem.eql(u8, prefix, "mtllib")) {
+            const mtllib = tokens.rest();
+            if (std.fs.path.dirname(obj_path)) |dir| {
+                if (std.fs.path.join(allocator, &[_][]const u8{ dir, mtllib })) |mtl_path| {
+                    defer allocator.free(mtl_path);
+                    parseMtl(allocator, mtl_path, &materials) catch {};
+                } else |_| {}
+            } else {
+                parseMtl(allocator, mtllib, &materials) catch {};
+            }
+        } else if (std.mem.eql(u8, prefix, "usemtl")) {
+            const mat_name = tokens.rest();
+            current_mat_id = -1;
+            for (materials.items, 0..) |m, idx| {
+                if (std.mem.eql(u8, m.name, mat_name)) {
+                    current_mat_id = @intCast(idx);
+                    break;
+                }
+            }
+        }
     }
 
-    if (ret != c.TINYOBJ_SUCCESS) {
-        return error.ObjParseFailed;
-    }
+    return ObjResult{
+        .vertices = try vertices.toOwnedSlice(allocator),
+        .normals = try normals.toOwnedSlice(allocator),
+        .texcoords = try texcoords.toOwnedSlice(allocator),
+        .faces = try faces.toOwnedSlice(allocator),
+        .material_ids = try material_ids.toOwnedSlice(allocator),
+        .materials = try materials.toOwnedSlice(allocator),
+    };
+}
+
+pub fn loadObjFlat(allocator: std.mem.Allocator, filepath: []const u8) !ModelData {
+
+    // 2. Parse using our brand new native tool!
+    var result = try parseObj(allocator, filepath);
+    defer result.deinit(allocator);
 
     // --- EXTRACT THE TEXTURE PATH ---
     var found_tex_path: ?[]u8 = null;
-
-    // Scan the parsed materials for the first diffuse texture it finds
-    if (materials != null and num_materials > 0) {
-        for (0..num_materials) |m_i| {
-            if (materials[m_i].diffuse_texname != null) {
-                const tex_slice = std.mem.span(materials[m_i].diffuse_texname);
-                const obj_path_slice = std.mem.span(filepath);
-
-                // --- JOIN THE DIRECTORY WITH THE TEXTURE NAME ---
-                if (std.fs.path.dirname(obj_path_slice)) |dir| {
+    if (result.materials.len > 0) {
+        for (result.materials) |mat| {
+            if (mat.diffuse_texname) |tex_slice| {
+                if (std.fs.path.dirname(filepath)) |dir| {
                     found_tex_path = std.fs.path.join(allocator, &[_][]const u8{ dir, tex_slice }) catch null;
                 } else {
                     found_tex_path = allocator.dupe(u8, tex_slice) catch null;
                 }
-                // ------------------------------------------------
-
                 break;
             }
         }
     }
 
-    // Free the C-allocations made by tinyobj_loader internally
-    defer c.tinyobj_attrib_free(&attrib);
-    defer c.tinyobj_shapes_free(shapes, num_shapes);
-    defer c.tinyobj_materials_free(materials, num_materials);
-
+    // --- UNROLL THE VERTICES FOR WEBGPU ---
     var vertices = std.ArrayList(Vertex3D){};
     errdefer vertices.deinit(allocator);
 
-    // --- UNROLL THE VERTICES ---
-    // attrib.num_faces represents the total number of index triplets.
-    // --- UNROLL THE VERTICES ---
-    for (0..attrib.num_faces) |i| {
-        const idx = attrib.faces[i];
+    // Result.faces holds our triangulated triplets
+    for (0..result.faces.len) |i| {
+        const idx = result.faces[i];
 
-        // 1. FETCH MATERIAL COLOR
-        const mat_id = attrib.material_ids[i / 3];
-        var face_color = [3]f32{ 0.8, 0.8, 0.8 }; // Default to light grey
-
-        // If the face has a valid material, read its diffuse color!
-        if (mat_id >= 0 and materials != null) {
-            const mat = materials[@intCast(mat_id)];
-            face_color[0] = mat.diffuse[0];
-            face_color[1] = mat.diffuse[1];
-            face_color[2] = mat.diffuse[2];
+        // 1. Fetch Material Color
+        var face_color = [3]f32{ 0.8, 0.8, 0.8 };
+        const mat_id = result.material_ids[i / 3];
+        if (mat_id >= 0 and mat_id < result.materials.len) {
+            face_color = result.materials[@as(usize, @intCast(mat_id))].diffuse;
         }
 
         var v = Vertex3D{
             .position = .{ 0.0, 0.0, 0.0 },
             .normal = .{ 0.0, 1.0, 0.0 },
             .uv = .{ 0.0, 0.0 },
-            .color = face_color, // Assign it here!
+            .color = face_color,
         };
 
-        // 1. Extract Position
+        // 2. Extract Position
         if (idx.v_idx >= 0) {
             const v_offset = @as(usize, @intCast(idx.v_idx)) * 3;
-            v.position[0] = attrib.vertices[v_offset + 0];
-            v.position[1] = attrib.vertices[v_offset + 1];
-            v.position[2] = attrib.vertices[v_offset + 2];
+            v.position[0] = result.vertices[v_offset + 0];
+            v.position[1] = result.vertices[v_offset + 1];
+            v.position[2] = result.vertices[v_offset + 2];
         }
 
-        // 2. Extract Normal
+        // 3. Extract Normal
         if (idx.vn_idx >= 0) {
             const vn_offset = @as(usize, @intCast(idx.vn_idx)) * 3;
-            v.normal[0] = attrib.normals[vn_offset + 0];
-            v.normal[1] = attrib.normals[vn_offset + 1];
-            v.normal[2] = attrib.normals[vn_offset + 2];
+            v.normal[0] = result.normals[vn_offset + 0];
+            v.normal[1] = result.normals[vn_offset + 1];
+            v.normal[2] = result.normals[vn_offset + 2];
         }
 
-        // 3. Extract UV (and flip V axis for WebGPU)
+        // 4. Extract UV (and flip V axis for WebGPU)
         if (idx.vt_idx >= 0) {
             const vt_offset = @as(usize, @intCast(idx.vt_idx)) * 2;
-            v.uv[0] = attrib.texcoords[vt_offset + 0];
-            v.uv[1] = 1.0 - attrib.texcoords[vt_offset + 1];
+            v.uv[0] = result.texcoords[vt_offset + 0];
+            v.uv[1] = 1.0 - result.texcoords[vt_offset + 1];
         }
 
         try vertices.append(allocator, v);
